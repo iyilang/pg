@@ -1,0 +1,971 @@
+# crystal-pg's spec/pg/replication_spec.cr.
+#
+# crystal-pg's examples need `wal_level = logical` and are skipped (with a
+# log line) otherwise; they are ported below in the same way. So that the
+# replication code is exercised on any server, the messages are also parsed
+# from bytes built per the protocol documentation, the handler of the spec
+# is fed those through a real `replication=database` connection, and the
+# parts of the connection that need no logical decoding (IDENTIFY_SYSTEM,
+# copy-both mode over a physical stream, keepalives, close, reconnect) are
+# run against the server.
+module pg/replication_test
+
+import std/int
+import std/text
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import std/uuid::{UUID}
+import std/uri::{URI}
+import std/socket::{IyiSocket}
+import db/db/db
+import db/db/errors::{DBError}
+import db/db/spec::{describe, it, expect_error, panics?}
+import pg/pq/errors::{StreamError}
+import pg/pq/stream::{ByteSource, MemorySource, Stream}
+import pg/errors::{PGError}
+import pg/core::{PGConnection}
+import pg/pg
+import pg/replication::{Handler, Connection}
+import pg/replication/messages::*
+import pg/testing/spec_helper::*
+
+# ------------------------------------------------------------ the handler
+
+alias TupleData = WALMessage::TupleData
+
+class TestMessageHandler < Handler
+  getter relations = {} of Int32 => Relation
+  getter types = {} of Int32 => Type
+  getter truncations = [] of Truncate
+  getter messages = [] of Message
+  getter origins = [] of Origin
+  getter transaction : Transaction? = nil
+  # crystal-pg's `Hash.new { |h, k| h[k] = {} of Bytes => TupleData }`;
+  # `data_for` makes the inner hash.
+  getter data = {} of Int32 => Hash(Bytes, TupleData)
+
+  def received(data : XLogData, connection : Connection, &) : Nil
+    yield
+    connection.last_wal_byte_flushed = data.wal_end
+    connection.last_wal_byte_applied = data.wal_end
+  end
+
+  def received(msg : Begin) : Nil
+    if transaction
+      raise "We are already running a transaction"
+    end
+
+    @transaction = Transaction.new(msg.transaction_id, msg.final_lsn, msg.timestamp)
+  end
+
+  def received(msg : Message) : Nil
+    @messages << msg
+  end
+
+  def received(msg : Commit) : Nil
+    running_transaction.events.each do |event|
+      if relation = relations[event.oid]?
+        # There can be multiple parts of the primary key
+        key = key_indexes(relation)
+        unless key.empty?
+          pk = make_key(event.tuple_data, key)
+          if event.type == EventType::Delete
+            data_for(event.oid).delete(pk)
+          else
+            data_for(event.oid)[pk] = event.tuple_data
+          end
+        end
+        # else: what do?
+      end
+    end
+    @transaction = nil
+  end
+
+  def received(msg : Origin) : Nil
+    @origins << msg
+  end
+
+  def received(msg : Relation) : Nil
+    relations[msg.oid] = msg
+  end
+
+  def received(type : Type) : Nil
+    types[type.oid] = type
+  end
+
+  def received(msg : Insert) : Nil
+    running_transaction.insert(msg.oid, msg.tuple_data)
+  end
+
+  def received(msg : Update) : Nil
+    running_transaction.update(msg.oid, msg.new_tuple_data, msg.old_tuple_data, msg.key_tuple_data)
+  end
+
+  # crystal-pg took `{msg.key_tuple_data, msg.old_tuple_data}.first.not_nil!`,
+  # which is the key tuple; the old tuple stands in when there is none.
+  def received(msg : Delete) : Nil
+    tuple = msg.key_tuple_data || msg.old_tuple_data
+    raise "A delete without a tuple" if tuple.nil?
+    running_transaction.delete(msg.oid, tuple)
+  end
+
+  def received(msg : Truncate) : Nil
+    truncations << msg
+  end
+
+  def data_for(oid : Int32) : Hash(Bytes, TupleData)
+    table = data[oid]?
+    return table if table
+    fresh = {} of Bytes => TupleData
+    data[oid] = fresh
+    fresh
+  end
+
+  # crystal-pg's `transaction!`: iyi names have no `!`.
+  private def running_transaction : Transaction
+    t = transaction
+    raise "No transaction is running" if t.nil?
+    t
+  end
+
+  private def key_indexes(relation : Relation) : Array(Int32)
+    key = [] of Int32
+    relation.columns.each_with_index do |column, index|
+      key << index if column.flags.key?
+    end
+    key
+  end
+
+  # crystal-pg's `Slice.join(key.map { |i| make_key(tuple_data[i]) })`.
+  private def make_key(tuple_data : TupleData, key : Array(Int32)) : Bytes
+    parts = key.map { |index| make_key(tuple_data[index]) }
+    size = parts.sum { |part| part.size }
+    joined = Bytes.new(size)
+    offset = 0
+    parts.each do |part|
+      (joined.to_unsafe + offset).copy_from(part.to_unsafe, part.size)
+      offset += part.size
+    end
+    joined
+  end
+
+  private def make_key(value : UnchangedTOASTValue | Bytes | String | Nil) : Bytes
+    case value
+    in String              then slice_of(value)
+    in Bytes               then value
+    in UnchangedTOASTValue then raise "Using a TOASTed value in a primary key is unsupported"
+    in Nil                 then Bytes.new(0)
+    end
+  end
+end
+
+enum EventType
+  Insert
+  Update
+  Delete
+end
+
+class Event
+  getter oid : Int32
+  getter tuple_data : TupleData
+  getter type : EventType
+  getter old_tuple_data : TupleData?
+  getter key_tuple_data : TupleData?
+
+  def initialize(@oid : Int32, @tuple_data : TupleData, @type : EventType, @old_tuple_data : TupleData? = nil, @key_tuple_data : TupleData? = nil)
+  end
+end
+
+class Transaction
+  getter id : Int32
+  getter final_lsn : Int64
+  getter timestamp : Time
+  getter events : Array(Event)
+
+  def initialize(@id : Int32, @final_lsn : Int64, @timestamp : Time)
+    @events = [] of Event
+  end
+
+  def insert(oid : Int32, tuple_data : TupleData) : Nil
+    events << Event.new(oid, tuple_data, EventType::Insert)
+  end
+
+  def update(oid : Int32, tuple_data : TupleData, old_tuple_data : TupleData?, key_tuple_data : TupleData?) : Nil
+    events << Event.new(oid, tuple_data, EventType::Update, old_tuple_data, key_tuple_data)
+  end
+
+  def delete(oid : Int32, tuple_data : TupleData) : Nil
+    events << Event.new(oid, tuple_data, EventType::Delete)
+  end
+end
+
+# --------------------------------------------------------------- the bytes
+
+def slice_of(text : String) : Bytes
+  Bytes.new(text.bytesize) { |i| text.to_unsafe[i] }
+end
+
+# Protocol bytes, big-endian, built up a value at a time.
+class Wire
+  @bytes = [] of UInt8
+
+  def u8(value : Int32) : Wire
+    @bytes << (value & 0xFF).to_u8
+    self
+  end
+
+  def char(value : Char) : Wire
+    u8(value.ord)
+  end
+
+  def i16(value : Int32) : Wire
+    u8(value >> 8).u8(value)
+  end
+
+  def i32(value : Int32) : Wire
+    u8(value >> 24).u8(value >> 16).u8(value >> 8).u8(value)
+  end
+
+  def i64(value : Int64) : Wire
+    i32((value >> 32).unsafe_to_i32).i32(value.unsafe_to_i32)
+  end
+
+  # A NUL-terminated string.
+  def cstr(text : String) : Wire
+    raw(slice_of(text)).u8(0)
+  end
+
+  def raw(bytes : Bytes) : Wire
+    bytes.each { |b| @bytes << b }
+    self
+  end
+
+  def raw(wire : Wire) : Wire
+    raw(wire.to_bytes)
+  end
+
+  # An Int32 length, then the bytes.
+  def sized(bytes : Bytes) : Wire
+    i32(bytes.size).raw(bytes)
+  end
+
+  # A backend message: its type, its length (itself included), its body.
+  def message(type : Char, body : Wire) : Wire
+    char(type).i32(body.size + 4).raw(body)
+  end
+
+  def size : Int32
+    @bytes.size
+  end
+
+  def to_bytes : Bytes
+    Bytes.new(@bytes.size) { |i| @bytes[i] }
+  end
+
+  def source : MemorySource
+    MemorySource.new(to_bytes)
+  end
+end
+
+def wire : Wire
+  Wire.new
+end
+
+T0     = Time.utc(2000, 1, 1)
+STAMP  = Time.utc(2024, 5, 6, 7, 8, 9) + Span.new(nanoseconds: 123_456_000)
+MICROS = TimeParser.microseconds(STAMP)
+
+UUID_BYTES = Bytes.new(16) { |i| (i * 17).to_u8 }
+
+# One XLogData CopyData frame carrying *message*.
+def xlog(wal_start : Int64, wal_end : Int64, message : Wire) : Wire
+  body = wire.char('w').i64(wal_start).i64(wal_end).i64(MICROS).raw(message)
+  wire.message('d', body)
+end
+
+def frame_of(bytes : Wire) : Frame
+  Frame.from_io(bytes.source).or_panic
+end
+
+def wal_of(bytes : Wire) : WALMessage
+  WALMessage.from_io(bytes.source).or_panic
+end
+
+# ----------------------------------------------------- the server examples
+
+def replication_url(params : String = "") : String
+  uri = URI.parse(DB_URL)
+  query = uri.query_params
+  query["replication"] = "database"
+  uri.query_params = query
+  url = uri.to_s
+  params.empty? ? url : "#{url}&#{params}"
+end
+
+def random_hex : String
+  UUID.v4.to_s.gsub("-", "")
+end
+
+def wal_level : String
+  PG_DB.query_one("SHOW wal_level", as: String).or_panic
+end
+
+# Polls *block* every 5 ms until it is true, failing after *timeout*.
+def wait_for(condition : String = "the block to return truthy", timeout : Span = Span.seconds(2), & : -> Bool) : Nil
+  start = Time.utc
+  until yield
+    if Time.utc - start > timeout
+      raise "Timed out waiting for #{condition}"
+    end
+    sleep(5)
+  end
+end
+
+# A replication connection's backends, by application name.
+def backend_pids(application_name : String) : Array(Int32)
+  pids = [] of Int32
+  PG_DB.query_each("SELECT pid FROM pg_stat_activity WHERE application_name = $1", application_name) do |rs|
+    pids << rs.read(Int32).or_panic
+  end.or_panic
+  pids
+end
+
+# =================================================================== examples
+
+describe "PG::Replication::TimeParser" do
+  it "reads microseconds since 2000-01-01 UTC" do
+    assert TimeParser.call(0_i64) == T0
+    assert TimeParser.call(1_500_000_i64) == T0 + Span.new(seconds: 1_i64, nanoseconds: 500_000_000)
+    assert TimeParser.call(-1_500_000_i64) == T0 - Span.new(seconds: 1_i64, nanoseconds: 500_000_000)
+    assert TimeParser.call(wire.i64(MICROS).source).or_panic == STAMP
+    assert TimeParser.microseconds(STAMP) == MICROS
+    expect_error(TimeParser.call(wire.i32(1).source), StreamError)
+    nil
+  end
+end
+
+describe "PG::Replication::WALMessage" do
+  it "parses Begin" do
+    msg = wal_of(wire.char('B').i64(0x1_0000_0010_i64).i64(MICROS).i32(735)).as(Begin)
+    assert msg.final_lsn == 0x1_0000_0010_i64
+    assert msg.timestamp == STAMP
+    assert msg.transaction_id == 735
+  end
+
+  it "parses Commit" do
+    msg = wal_of(wire.char('C').u8(0).i64(100_i64).i64(200_i64).i64(MICROS)).as(Commit)
+    assert msg.flags == 0_i8
+    assert msg.begin_lsn == 100_i64
+    assert msg.end_lsn == 200_i64
+    assert msg.timestamp == STAMP
+  end
+
+  it "parses Origin" do
+    msg = wal_of(wire.char('O').i64(42_i64).cstr("upstream")).as(Origin)
+    assert msg.lsn == 42_i64
+    assert msg.name == "upstream"
+  end
+
+  it "parses Relation" do
+    bytes = wire.char('R').i32(16384).cstr("public").cstr("things").u8('d'.ord)
+      .i16(2)
+      .u8(1).cstr("id").i32(2950).i32(-1)
+      .u8(0).cstr("string").i32(25).i32(-1)
+    msg = wal_of(bytes).as(Relation)
+    assert msg.oid == 16384
+    assert msg.namespace == "public"
+    assert msg.name == "things"
+    assert msg.replica_identity == 'd'.ord.to_i8
+    assert msg.columns.size == 2
+    id = msg.columns[0]
+    assert id.name == "id"
+    assert id.flags.key?
+    assert id.oid == 2950
+    assert id.type_modifier == -1
+    assert msg.columns[1].name == "string"
+    assert !msg.columns[1].flags.key?
+    assert msg.columns[1].oid == 25
+  end
+
+  it "parses Type" do
+    msg = wal_of(wire.char('Y').i32(70000).cstr("public").cstr("mood")).as(Type)
+    assert msg.oid == 70000
+    assert msg.namespace == "public"
+    assert msg.data_type == "mood"
+  end
+
+  it "parses Insert and every kind of TupleData" do
+    tuple = wire.i16(4).char('n').char('u').char('t').sized(slice_of("asdf")).char('b').sized(UUID_BYTES)
+    msg = wal_of(wire.char('I').i32(16384).char('N').raw(tuple)).as(Insert)
+    assert msg.oid == 16384
+    data = msg.tuple_data
+    assert data.size == 4
+    assert data[0].nil?
+    assert data[1] == UnchangedTOASTValue.new
+    assert data[2] == "asdf"
+    assert data[3] == UUID_BYTES
+  end
+
+  it "parses Update with only a new tuple" do
+    msg = wal_of(wire.char('U').i32(1).char('N').i16(1).char('t').sized(slice_of("new"))).as(Update)
+    assert msg.oid == 1
+    assert msg.key_tuple_data.nil?
+    assert msg.old_tuple_data.nil?
+    assert msg.new_tuple_data == ["new"] of UnchangedTOASTValue | Bytes | String | Nil
+  end
+
+  it "parses Update with a key tuple" do
+    bytes = wire.char('U').i32(1)
+      .char('K').i16(1).char('b').sized(UUID_BYTES)
+      .char('N').i16(1).char('t').sized(slice_of("new"))
+    msg = wal_of(bytes).as(Update)
+    key = msg.key_tuple_data
+    assert !key.nil? && key[0] == UUID_BYTES
+    assert msg.old_tuple_data.nil?
+    assert msg.new_tuple_data[0] == "new"
+  end
+
+  it "parses Update with an old tuple" do
+    bytes = wire.char('U').i32(1)
+      .char('O').i16(1).char('t').sized(slice_of("old"))
+      .char('N').i16(1).char('t').sized(slice_of("new"))
+    msg = wal_of(bytes).as(Update)
+    old = msg.old_tuple_data
+    assert !old.nil? && old[0] == "old"
+    assert msg.key_tuple_data.nil?
+    assert msg.new_tuple_data[0] == "new"
+  end
+
+  it "answers an error for an Update without its new tuple" do
+    bytes = wire.char('U').i32(1).char('K').i16(1).char('n').char('X')
+    expect_error(WALMessage.from_io(bytes.source), PGError, "Expected new TupleData byte marker, got: 0x58 ('X')")
+    nil
+  end
+
+  it "parses Delete with a key tuple" do
+    msg = wal_of(wire.char('D').i32(9).char('K').i16(1).char('b').sized(UUID_BYTES)).as(Delete)
+    assert msg.oid == 9
+    key = msg.key_tuple_data
+    assert !key.nil? && key[0] == UUID_BYTES
+    assert msg.old_tuple_data.nil?
+  end
+
+  it "parses Delete with an old tuple" do
+    msg = wal_of(wire.char('D').i32(9).char('O').i16(1).char('t').sized(slice_of("gone"))).as(Delete)
+    old = msg.old_tuple_data
+    assert !old.nil? && old[0] == "gone"
+    assert msg.key_tuple_data.nil?
+  end
+
+  it "answers an error for a Delete without a tuple marker" do
+    expect_error(WALMessage.from_io(wire.char('D').i32(9).char('N').source), PGError, "Expected new TupleData byte marker", partial: true)
+    nil
+  end
+
+  it "parses Truncate" do
+    msg = wal_of(wire.char('T').i32(2).u8(3).i32(100).i32(200)).as(Truncate)
+    assert msg.options.cascade?
+    assert msg.options.restart_identity?
+    assert msg.relation_oids == [100, 200]
+    plain = wal_of(wire.char('T').i32(1).u8(0).i32(5)).as(Truncate)
+    assert plain.options.none?
+    assert plain.relation_oids == [5]
+  end
+
+  it "parses Message" do
+    msg = wal_of(wire.char('M').u8(1).i64(77_i64).cstr("my_prefix").sized(slice_of("hello"))).as(Message)
+    assert msg.flags.transactional?
+    assert msg.lsn == 77_i64
+    assert msg.prefix == "my_prefix"
+    assert msg.content == slice_of("hello")
+    assert !wal_of(wire.char('M').u8(0).i64(1_i64).cstr("p").sized(Bytes.new(0))).as(Message).flags.transactional?
+  end
+
+  it "answers an error for an unknown message or tuple marker" do
+    expect_error(WALMessage.from_io(wire.char('Z').source), PGError, "Unexpected WAL message byte marker: 0x5a ('Z')")
+    expect_error(WALMessage.from_io(wire.char('I').i32(1).char('N').i16(1).char('x').source), PGError, "Unexpected TupleData byte marker: 0x78 ('x')")
+    nil
+  end
+
+  it "answers a StreamError when the bytes run out" do
+    expect_error(WALMessage.from_io(wire.source), StreamError)
+    expect_error(WALMessage.from_io(wire.char('B').i64(1_i64).source), StreamError)
+    expect_error(WALMessage.from_io(wire.char('O').i64(1_i64).u8('a'.ord).source), StreamError)
+    nil
+  end
+end
+
+describe "PG::Replication::Frame" do
+  it "parses CopyData carrying XLogData" do
+    insert = wire.char('I').i32(16384).char('N').i16(1).char('t').sized(slice_of("x"))
+    frame = frame_of(xlog(10_i64, 20_i64, insert)).as(CopyData)
+    data = frame.data.as(XLogData)
+    assert data.wal_start == 10_i64
+    assert data.wal_end == 20_i64
+    assert data.timestamp == STAMP
+    assert data.message.as(Insert).tuple_data == ["x"] of UnchangedTOASTValue | Bytes | String | Nil
+  end
+
+  it "parses CopyData carrying a KeepAlive" do
+    frame = frame_of(wire.message('d', wire.char('k').i64(99_i64).i64(MICROS).u8(1))).as(CopyData)
+    keepalive = frame.data.as(KeepAlive)
+    assert keepalive.wal_end == 99_i64
+    assert keepalive.timestamp == STAMP
+    assert keepalive.response_expected?
+    quiet = frame_of(wire.message('d', wire.char('k').i64(1_i64).i64(0_i64).u8(0))).as(CopyData)
+    assert !quiet.data.as(KeepAlive).response_expected?
+  end
+
+  it "parses CopyBoth" do
+    frame = frame_of(wire.message('W', wire.u8(0).i16(0))).as(CopyBoth)
+    assert frame.format == CopyBoth::Format::Text
+    assert frame.column_formats.empty?
+    binary = frame_of(wire.message('W', wire.u8(1).i16(2).i16(1).i16(0))).as(CopyBoth)
+    assert binary.format == CopyBoth::Format::Binary
+    assert binary.column_formats == [1_i16, 0_i16]
+  end
+
+  it "parses ErrorFrame" do
+    body = wire.char('S').cstr("ERROR").char('V').cstr("ERROR").char('C').cstr("42704")
+      .char('M').cstr("replication slot \"nope\" does not exist")
+      .char('D').cstr("some detail").char('H').cstr("some hint").u8(0)
+    frame = frame_of(wire.message('E', body)).as(ErrorFrame)
+    assert frame.severity == Severity::ERROR
+    assert frame.message == "replication slot \"nope\" does not exist"
+    assert frame.detail == "some detail"
+    assert frame.hint == "some hint"
+    assert frame.misc == [{'V', "ERROR"}, {'C', "42704"}]
+
+    # a localized severity is none of `Severity`'s names
+    localized = frame_of(wire.message('E', wire.char('S').cstr("HATA").char('M').cstr("x").u8(0))).as(ErrorFrame)
+    assert localized.severity.nil?
+    assert localized.message == "x"
+    assert localized.detail.nil?
+  end
+
+  it "answers an error for an unknown frame and reads on after it" do
+    io = wire
+      .message('Z', wire.char('I'))
+      .message('d', wire.char('?').i32(1))
+      .message('d', wire.char('k').i64(5_i64).i64(0_i64).u8(0))
+      .source
+    expect_error(Frame.from_io(io), PGError, "Unexpected byte marker: 0x5a ('Z')")
+    expect_error(Frame.from_io(io), PGError, "Unexpected CopyData byte marker: 0x3f ('?')")
+    keepalive = Frame.from_io(io).or_panic.as(CopyData).data.as(KeepAlive)
+    assert keepalive.wal_end == 5_i64
+    assert io.remaining == 0
+    expect_error(Frame.from_io(io), StreamError)
+    nil
+  end
+
+  it "answers a StreamError for a frame cut short" do
+    bytes = xlog(1_i64, 2_i64, wire.char('O').i64(1_i64).cstr("name")).to_bytes
+    expect_error(Frame.from_io(MemorySource.new(bytes[0, bytes.size - 3])), StreamError)
+    nil
+  end
+end
+
+describe "PG::Replication writers" do
+  it "writes StandbyStatusUpdate in CopyData" do
+    listener = IyiSocket.listen("127.0.0.1", 0)
+    client = IyiSocket.connect("127.0.0.1", listener.local_port).as(IyiSocket)
+    server = listener.accept.as(IyiSocket)
+    sink = Stream.new(client)
+    update = StandbyStatusUpdate.new(1_i64, 2_i64, 0x1_0000_0003_i64, timestamp: STAMP, response_expected: true)
+    assert update.response_expected?
+    CopyData.new(update).to_io(sink).or_panic
+    CopyData.new(StandbyStatusUpdate.new(4_i64, 5_i64, 6_i64, timestamp: T0)).to_io(sink).or_panic
+    sink.flush.or_panic
+
+    expected = wire
+      .char('d').i32(38).char('r').i64(1_i64).i64(2_i64).i64(0x1_0000_0003_i64).i64(MICROS).u8(1)
+      .char('d').i32(38).char('r').i64(4_i64).i64(5_i64).i64(6_i64).i64(0_i64).u8(0)
+      .to_bytes
+    got = Stream.new(server).read_bytes(expected.size).or_panic
+    assert got == expected, "#{got.hexstring} != #{expected.hexstring}"
+    client.close
+    server.close
+    listener.close
+  end
+
+  it "stamps StandbyStatusUpdate with the time it is made" do
+    before = Time.utc
+    update = StandbyStatusUpdate.new(0_i64, 0_i64, 0_i64)
+    assert update.timestamp >= before && update.timestamp <= Time.utc
+    assert !update.response_expected?
+    assert update.bytesize == 34
+  end
+
+  it "answers an error for writing what only the server sends" do
+    listener = IyiSocket.listen("127.0.0.1", 0)
+    client = IyiSocket.connect("127.0.0.1", listener.local_port).as(IyiSocket)
+    server = listener.accept.as(IyiSocket)
+    sink = Stream.new(client)
+    data = XLogData.new(1_i64, 2_i64, STAMP, Origin.new(1_i64, "x"))
+    expect_error(CopyData.new(data).to_io(sink), PGError, "XLogData messages are meant to be sent by the server, not received by the client")
+    keepalive = KeepAlive.new(1_i64, STAMP, false)
+    expect_error(CopyData.new(keepalive).to_io(sink), PGError, "KeepAlives are intended to be received from the server, not sent to it")
+    client.close
+    server.close
+    listener.close
+    nil
+  end
+end
+
+describe "PG::Replication::Connection" do
+  it "opens a replication=database connection that answers IDENTIFY_SYSTEM" do
+    connection = Connection.open(DB_URL, TestMessageHandler.new, publication_name: "unused", slot_name: "unused").or_panic
+    assert connection.connection.connection.conninfo.replication == "database"
+    assert connection.keepalive_interval == Span.seconds(10)
+    connection.connection.exec_all("IDENTIFY_SYSTEM").or_panic
+    assert !connection.closed?
+    connection.close
+    assert connection.closed?
+    assert connection.connection.connection.closed?
+    # closing twice is a no-op
+    connection.close
+  end
+
+  it "hands the stream to its handler and records the WAL positions" do
+    handler = TestMessageHandler.new
+    connection = Connection.open(DB_URL, handler, publication_name: "unused", slot_name: "unused").or_panic
+    feed = ->(bytes : Wire) { connection.received(frame_of(bytes)) }
+
+    oid = 16384
+    relation = wire.char('R').i32(oid).cstr("public").cstr("test_table").u8('d'.ord)
+      .i16(2).u8(1).cstr("id").i32(2950).i32(-1).u8(0).cstr("string").i32(25).i32(-1)
+    begin_1 = wire.char('B').i64(300_i64).i64(MICROS).i32(700)
+    insert = wire.char('I').i32(oid).char('N').i16(2).char('b').sized(UUID_BYTES).char('b').sized(slice_of("asdf"))
+    commit_1 = wire.char('C').u8(0).i64(100_i64).i64(300_i64).i64(MICROS)
+
+    feed.call(wire.message('W', wire.u8(0).i16(0)))
+    feed.call(xlog(100_i64, 100_i64, begin_1))
+    assert connection.last_wal_byte_received == 100_i64
+    t = handler.transaction
+    raise "no transaction began" if t.nil?
+    assert t.id == 700 && t.final_lsn == 300_i64 && t.timestamp == STAMP
+    feed.call(xlog(150_i64, 150_i64, relation))
+    feed.call(xlog(200_i64, 200_i64, insert))
+    feed.call(xlog(300_i64, 300_i64, commit_1))
+    assert handler.transaction.nil?
+    assert connection.last_wal_byte_received == 300_i64
+    assert connection.last_wal_byte_flushed == 300_i64
+    assert connection.last_wal_byte_applied == 300_i64
+
+    # new relations
+    rel = handler.relations[oid]
+    assert rel.namespace == "public"
+    assert rel.name == "test_table"
+    id_column = rel.columns.find { |column| column.name == "id" }
+    assert !id_column.nil? && id_column.flags.key?
+
+    # inserts
+    records = handler.data[oid]
+    assert records.size == 1
+    assert records.keys.first == UUID_BYTES
+    assert records[UUID_BYTES][1] == slice_of("asdf")
+
+    # updates
+    update = wire.char('U').i32(oid).char('N').i16(2).char('b').sized(UUID_BYTES).char('b').sized(slice_of("lol"))
+    feed.call(xlog(400_i64, 400_i64, wire.char('B').i64(500_i64).i64(MICROS).i32(701)))
+    feed.call(xlog(450_i64, 450_i64, update))
+    feed.call(xlog(500_i64, 500_i64, wire.char('C').u8(0).i64(400_i64).i64(500_i64).i64(MICROS)))
+    assert handler.data[oid][UUID_BYTES][1] == slice_of("lol")
+
+    # deletes
+    delete = wire.char('D').i32(oid).char('K').i16(2).char('b').sized(UUID_BYTES).char('n')
+    feed.call(xlog(600_i64, 600_i64, wire.char('B').i64(700_i64).i64(MICROS).i32(702)))
+    feed.call(xlog(650_i64, 650_i64, delete))
+    feed.call(xlog(700_i64, 700_i64, wire.char('C').u8(0).i64(600_i64).i64(700_i64).i64(MICROS)))
+    assert handler.data[oid].empty?
+
+    # new types
+    feed.call(xlog(710_i64, 710_i64, wire.char('Y').i32(70000).cstr("public").cstr("test_type_abc")))
+    assert handler.types[70000].data_type == "test_type_abc"
+
+    # schema changes
+    altered = wire.char('R').i32(oid).cstr("public").cstr("test_table").u8('d'.ord).i16(1).u8(1).cstr("id").i32(2950).i32(-1)
+    feed.call(xlog(720_i64, 720_i64, altered))
+    assert handler.relations[oid].columns.size == 1
+
+    # truncations
+    feed.call(xlog(730_i64, 730_i64, wire.char('T').i32(1).u8(0).i32(oid)))
+    assert handler.truncations.size == 1
+    assert handler.truncations[0].relation_oids == [oid]
+
+    # messages and origins reach their overloads too
+    feed.call(xlog(740_i64, 740_i64, wire.char('M').u8(0).i64(740_i64).cstr("p").sized(slice_of("c"))))
+    feed.call(xlog(750_i64, 750_i64, wire.char('O').i64(750_i64).cstr("elsewhere")))
+    assert handler.messages.size == 1 && handler.origins[0].name == "elsewhere"
+
+    # a keepalive that asks for no answer only moves nothing
+    feed.call(wire.message('d', wire.char('k').i64(800_i64).i64(MICROS).u8(0)))
+    feed.call(wire.message('E', wire.char('S').cstr("ERROR").char('M').cstr("ignored").u8(0)))
+    assert connection.last_wal_byte_received == 750_i64
+    assert connection.last_wal_byte_flushed == 750_i64
+
+    connection.close
+  end
+
+  it "refuses to receive a KeepAliveResponse" do
+    connection = Connection.open(DB_URL, TestMessageHandler.new, publication_name: "unused", slot_name: "unused").or_panic
+    assert panics? { connection.received(CopyData.new(StandbyStatusUpdate.new(0_i64, 0_i64, 0_i64))) }
+    connection.close
+  end
+
+  it "speaks copy-both mode: a status update asking for a reply is answered with a KeepAlive" do
+    # A physical stream needs no logical decoding: wal_level=replica will do.
+    lsn = PG_DB.query_one("SELECT pg_current_wal_lsn()::text", as: String).or_panic
+    conn = Connection.connect(replication_url).or_panic
+    pq = conn.connection
+    pq.send_query_message("START_REPLICATION PHYSICAL #{lsn}").or_panic
+    copy_both = Frame.from_io(pq.stream).or_panic.as(CopyBoth)
+    # walsender's CopyBothResponse: overall format 0, no columns
+    assert copy_both.format == CopyBoth::Format::Text
+    assert copy_both.column_formats.empty?
+
+    CopyData.new(StandbyStatusUpdate.new(0_i64, 0_i64, 0_i64, response_expected: true)).to_io(pq.stream).or_panic
+    pq.stream.flush.or_panic
+
+    # WAL other sessions write may come first, as XLogData of physical WAL
+    # that is no logical message: it costs only itself.
+    keepalive = nil.as(KeepAlive?)
+    tries = 0
+    while keepalive.nil? && tries < 10_000
+      frame = Frame.from_io(pq.stream)
+      raise "the stream failed: #{frame.message}" if frame.is_a?(StreamError)
+      if frame.is_a?(CopyData)
+        data = frame.data
+        keepalive = data if data.is_a?(KeepAlive)
+      end
+      tries += 1
+    end
+    ka = keepalive
+    raise "no KeepAlive came" if ka.nil?
+    assert ka.wal_end > 0_i64
+    assert (Time.utc - ka.timestamp).total_seconds.abs < 600.0
+    conn.close
+  end
+
+  it "streams in a task of a group until closed" do
+    app = "iyi_repl_#{random_hex}"
+    handler = TestMessageHandler.new
+    started = Time.utc
+    group do |g|
+      # The slot does not exist: the server answers START_REPLICATION with
+      # an error and waits for the next command, which keepalives do not
+      # disturb.
+      subscriber = ::Pg::Pg.connect_replication(replication_url("application_name=#{app}"),
+        handler: handler,
+        publication_name: "test_publication_#{random_hex}",
+        slot_name: "test_slot_#{random_hex}",
+        keepalive_interval: Span.milliseconds(50),
+        group: g).or_panic
+      assert subscriber.keepalive_interval == Span.milliseconds(50)
+      sleep(300)
+      assert backend_pids(app).size == 1
+      assert !subscriber.closed?
+      subscriber.close
+      assert subscriber.closed?
+      nil
+    end
+    # the group ended: both tasks stopped at the close
+    assert Time.utc - started < Span.seconds(5)
+    wait_for("the backend to go away") { backend_pids(app).empty? }
+    assert handler.relations.empty?
+  end
+
+  it "stops its tasks at close while they sleep" do
+    started = Time.utc
+    group do |g|
+      connection = Connection.open(DB_URL, TestMessageHandler.new, publication_name: "p_#{random_hex}", slot_name: "s_#{random_hex}").or_panic
+      g.spawn do
+        # crystal-pg's `blocking: true`, run in a task so this one can close it
+        connection.run
+        0
+      end
+      sleep(100)
+      connection.close
+      nil
+    end
+    # the keepalive task slept for 10 seconds; the close woke it
+    assert Time.utc - started < Span.seconds(5)
+  end
+
+  it "reconnects when the connection drops" do
+    app = "iyi_repl_#{random_hex}"
+    group do |g|
+      subscriber = Connection.open(replication_url("application_name=#{app}"), TestMessageHandler.new, publication_name: "p_#{random_hex}", slot_name: "s_#{random_hex}").or_panic
+      subscriber.start(g)
+      wait_for("the backend to start") { backend_pids(app).size == 1 }
+      first = subscriber.connection
+      pid = backend_pids(app).first
+      PG_DB.exec("SELECT pg_terminate_backend($1)", pid).or_panic
+      wait_for("a new backend", Span.seconds(10)) do
+        pids = backend_pids(app)
+        pids.size == 1 && pids.first != pid
+      end
+      assert subscriber.connection.object_id != first.object_id
+      assert !subscriber.closed?
+      subscriber.close
+      nil
+    end
+    wait_for("the backend to go away") { backend_pids(app).empty? }
+  end
+end
+
+# ----------------------------------------------- crystal-pg's own examples
+
+class Context
+  getter table_name : String = "test_table_#{random_hex}"
+  getter publication_name : String = "test_publication_#{random_hex}"
+  getter slot_name : String = "test_slot_#{random_hex}"
+  getter type_name : String = "test_type_#{random_hex}"
+end
+
+def it_consumes_wal(name : String, &block : TestMessageHandler, Context -> Nil) : Nil
+  it "consumes #{name} from the WAL" do
+    context = Context.new
+    handler = TestMessageHandler.new
+    PG_DB.exec("CREATE PUBLICATION #{context.publication_name} FOR ALL TABLES").or_panic
+    PG_DB.exec("SELECT pg_create_logical_replication_slot($1, 'pgoutput')", context.slot_name).or_panic
+    defer cleanup_wal_examples
+    group do |g|
+      subscriber = ::Pg::Pg.connect_replication(DB_URL,
+        handler: handler,
+        publication_name: context.publication_name,
+        slot_name: context.slot_name,
+        group: g).or_panic
+      defer subscriber.close
+      block.call(handler, context)
+      nil
+    end
+  end
+end
+
+def cleanup_wal_examples : Nil
+  PG_DB.exec("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'test_slot_%'")
+  names = [] of String
+  PG_DB.query_each("SELECT DISTINCT pubname::text FROM pg_publication_tables WHERE schemaname = 'public' and pubname::text LIKE 'test_publication_%'") do |rs|
+    names << rs.read(String).or_panic
+  end
+  names.each { |n| PG_DB.exec("DROP PUBLICATION #{n}") }
+  names.clear
+  PG_DB.query_each("SELECT tablename::text FROM pg_tables WHERE schemaname = 'public' and tablename LIKE 'test_table_%'") do |rs|
+    names << rs.read(String).or_panic
+  end
+  names.each { |n| PG_DB.exec("DROP TABLE IF EXISTS #{n}") }
+  names.clear
+  PG_DB.query_each("SELECT typname::text FROM pg_type WHERE typname LIKE 'test_type_%'") do |rs|
+    names << rs.read(String).or_panic
+  end
+  names.each { |n| PG_DB.exec("DROP TYPE IF EXISTS #{n}") }
+  nil
+end
+
+def any_records?(handler : TestMessageHandler) : Bool
+  handler.data.values.any? { |records| !records.empty? }
+end
+
+# crystal-pg's examples use `UUID.v7`; std/uuid makes only v4, which serves
+# as well for a primary key here.
+if wal_level == "logical"
+  describe "PG::Replication" do
+    it_consumes_wal "new relations" do |handler, context|
+      PG_DB.exec("CREATE TABLE #{context.table_name} (id UUID PRIMARY KEY, string TEXT)").or_panic
+      # Apparently the Relation message isn't sent until after data is inserted
+      # into the table. Without this insert, the `wait_for` call times out.
+      PG_DB.exec("INSERT INTO #{context.table_name} (id, string) VALUES ($1, $2)", UUID.v4.to_s, "yep").or_panic
+
+      wait_for { !handler.relations.empty? }
+      relation = handler.relations.values.first
+
+      assert relation.namespace == "public"
+      assert relation.name == context.table_name
+      # The `id` column must be indicated as part of the relation's primary key
+      id = relation.columns.find { |column| column.name == "id" }
+      assert !id.nil? && id.flags.key?
+    end
+
+    it_consumes_wal "inserts" do |handler, context|
+      id = UUID.v4
+      string = "asdf"
+      PG_DB.exec("CREATE TABLE #{context.table_name} (id UUID PRIMARY KEY, string TEXT)").or_panic
+      PG_DB.exec("INSERT INTO #{context.table_name} (id, string) VALUES ($1, $2)", id.to_s, string).or_panic
+
+      wait_for { any_records?(handler) }
+
+      records = handler.data.values.first
+      pk = records.keys.first
+      tuple = records[pk]
+      assert pk == Bytes.new(16) { |i| id.bytes[i] }
+      assert tuple[1] == slice_of(string)
+    end
+
+    it_consumes_wal "updates" do |handler, context|
+      id = UUID.v4
+      string = "omg"
+      PG_DB.exec("CREATE TABLE #{context.table_name} (id UUID PRIMARY KEY, string TEXT)").or_panic
+      PG_DB.exec("INSERT INTO #{context.table_name} (id, string) VALUES ($1, $2)", id.to_s, string).or_panic
+      PG_DB.exec("UPDATE #{context.table_name} SET string = 'lol' WHERE id = $1", id.to_s).or_panic
+
+      # Wait for at least the insert to propagate
+      wait_for { any_records?(handler) }
+      # Give the update just a little longer to come in
+      wait_for("record to be updated") do
+        records = handler.data.values.first
+        records.values.first[1] == slice_of("lol")
+      end
+    end
+
+    it_consumes_wal "deletes" do |handler, context|
+      id = UUID.v4
+      string = "omg"
+      PG_DB.exec("CREATE TABLE #{context.table_name} (id UUID PRIMARY KEY, string TEXT)").or_panic
+      PG_DB.exec("INSERT INTO #{context.table_name} (id, string) VALUES ($1, $2)", id.to_s, string).or_panic
+      wait_for("insert to propagate") { any_records?(handler) }
+
+      PG_DB.exec("DELETE FROM #{context.table_name} WHERE id = $1", id.to_s).or_panic
+      wait_for("data to be deleted") { handler.data.values.first.empty? }
+    end
+
+    it_consumes_wal "new types" do |handler, context|
+      PG_DB.exec("CREATE TYPE #{context.type_name} AS ENUM ('one', 'two', 'three')").or_panic
+      # The type isn't sent until there's a table that uses it
+      PG_DB.exec("CREATE TABLE #{context.table_name} (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), thing #{context.type_name})").or_panic
+      # ... and the table isn't sent until there's a record in it
+      PG_DB.exec("INSERT INTO #{context.table_name} (thing) VALUES ('three')").or_panic
+
+      # Wait for the insert to propagate
+      wait_for { !handler.types.empty? }
+
+      assert handler.types.values.first.data_type == context.type_name
+    end
+
+    it_consumes_wal "schema changes" do |handler, context|
+      PG_DB.exec("CREATE TABLE #{context.table_name} (id UUID PRIMARY KEY DEFAULT gen_random_uuid())").or_panic
+      PG_DB.exec("INSERT INTO #{context.table_name} (id) VALUES ($1)", UUID.v4.to_s).or_panic
+      wait_for { !handler.relations.empty? }
+      # Make sure we get that the table has 1 column before proceeding
+      wait_for { handler.relations.values.first.columns.size == 1 }
+
+      PG_DB.exec("ALTER TABLE #{context.table_name} ADD COLUMN string TEXT").or_panic
+      PG_DB.exec("INSERT INTO #{context.table_name} (id, string) VALUES ($1, $2)", UUID.v4.to_s, "my string").or_panic
+
+      # Now the table has 2 columns
+      wait_for { handler.relations.values.first.columns.size == 2 }
+    end
+
+    it_consumes_wal "truncations" do |handler, context|
+      PG_DB.exec("CREATE TABLE #{context.table_name} (id UUID PRIMARY KEY DEFAULT gen_random_uuid())").or_panic
+      PG_DB.exec("INSERT INTO #{context.table_name} (id) VALUES ($1)", UUID.v4.to_s).or_panic
+      wait_for { !handler.relations.empty? }
+
+      PG_DB.exec("TRUNCATE #{context.table_name}").or_panic
+
+      wait_for { !handler.truncations.empty? }
+    end
+  end
+else
+  puts "Skipping pg/replication_test.iyi's WAL examples: wal_level is #{wal_level}; set wal_level=logical in postgresql.conf to enable"
+end

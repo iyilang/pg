@@ -1,0 +1,349 @@
+# Logical replication: a connection that streams a publication's changes
+# from a replication slot and hands each message to a `Handler`.
+# crystal-pg's `src/pg/replication.cr`; the messages are in
+# `pg/replication/messages`.
+#
+# ```
+# group do |g|
+#   connection = Pg::Pg.connect_replication(db_url,
+#     handler: MyHandler.new,
+#     publication_name: "my_publication",
+#     slot_name: "my_replication_slot",
+#     group: g)!
+#   # ...
+#   connection.close
+# end
+# ```
+module pg/replication
+
+import std/int
+import std/uri::{URI}
+import std/time::{Span}
+import std/log::{Log}
+import db/db/db
+import db/db/errors::{DBError}
+import pg/pq/errors::{StreamError}
+import pg/pq/stream::{Stream}
+import pg/core::{PGConnection}
+import pg/replication/messages::*
+
+LOG = Log.for("pg.replication")
+
+# What a `Connection` hands the stream to. crystal-pg's `module Handler`,
+# included by the user's class; here an abstract class to inherit, with a
+# no-op `received` for each `WALMessage` type to override.
+pub abstract class Handler
+  # This method must be defined in order to tell the `Connection` how much of
+  # the WAL has been flushed and applied. Yielding hands the message to the
+  # `received` overload for its type.
+  #
+  # ```
+  # class MyHandler < Pg::Replication::Handler
+  #   def received(data : XLogData, connection : Pg::Replication::Connection, &) : Nil
+  #     yield
+  #     connection.last_wal_byte_flushed = data.wal_end
+  #     if data.message.is_a?(Commit)
+  #       connection.last_wal_byte_applied = data.wal_end
+  #     end
+  #   end
+  # end
+  # ```
+  abstract def received(data : XLogData, connection : Connection, &) : Nil
+
+  # Override these with any of the `WALMessage` subclasses to handle
+  # receiving replication messages of that type.
+  #
+  # ```
+  # class MyHandler < Pg::Replication::Handler
+  #   def received(insert : Insert) : Nil
+  #     publish(insert.oid, insert.tuple_data)
+  #   end
+  # end
+  # ```
+  def received(msg : Begin) : Nil
+  end
+
+  def received(msg : Commit) : Nil
+  end
+
+  def received(msg : Origin) : Nil
+  end
+
+  def received(msg : Relation) : Nil
+  end
+
+  def received(msg : Type) : Nil
+  end
+
+  def received(msg : Insert) : Nil
+  end
+
+  def received(msg : Update) : Nil
+  end
+
+  def received(msg : Delete) : Nil
+  end
+
+  def received(msg : Truncate) : Nil
+  end
+
+  def received(msg : Message) : Nil
+  end
+end
+
+# A replication connection: it streams from the slot, tells the server how
+# far it got every `keepalive_interval`, and reconnects (resuming from the
+# last flushed WAL position) whenever the connection drops, until `#close`.
+#
+# crystal-pg's constructor spawned a keepalive fiber and a run-loop fiber.
+# An iyi task cannot outlive its group (SPEC.md III.4.1), so `#run` opens a
+# group of its own for the two, and `#start` runs that in a task of the
+# caller's group. Both tasks run on one thread and a write never parks
+# halfway through a message, so crystal-pg's write `Mutex` has no work here.
+pub class Connection
+  BASE_RECONNECT_BACKOFF = Span.seconds(1)
+  MAX_RECONNECT_BACKOFF  = Span.seconds(30)
+
+  getter handler : Handler
+  getter publication_name : String
+  getter slot_name : String
+  # How often the backstop task sends a standby status update to keep the
+  # server from tripping its `wal_sender_timeout`. Ideally set to less than
+  # half of that timeout to avoid being disconnected by the Postgres server.
+  # Defaults to 10 seconds.
+  getter keepalive_interval : Span
+  getter last_wal_byte_received : Int64 = 0_i64
+  property last_wal_byte_flushed : Int64 = 0_i64
+  property last_wal_byte_applied : Int64 = 0_i64
+  @closed = false
+  @url : String
+  @conn : PGConnection
+  # The group `#run` opened, while it runs: `#close` cancels its tasks.
+  @tasks : IyiGroup? = nil
+
+  # :nodoc:
+  def initialize(@url : String, @conn : PGConnection, @handler : Handler, @publication_name : String, @slot_name : String, @keepalive_interval : Span)
+  end
+
+  # Connects to *uri* as a `replication=database` connection. Nothing is
+  # streamed until `#run` or `#start`.
+  def self.open(uri : URI | String, handler : Handler, *, publication_name : String, slot_name : String, keepalive_interval : Span = Span.seconds(10)) : Connection | DBError
+    uri = uri.is_a?(String) ? URI.parse(uri) : uri.dup
+    query_params = uri.query_params
+    query_params["replication"] = "database"
+    uri.query_params = query_params
+    url = uri.to_s
+    conn = Connection.connect(url)!
+    Connection.new(url, conn, handler, publication_name, slot_name, keepalive_interval)
+  end
+
+  # :nodoc:
+  def self.connect(url : String) : PGConnection | DBError
+    connection = ::Db::Db.connect(url)!
+    unless connection.is_a?(PGConnection)
+      connection.close
+      return DBError.new("#{url} is not a PostgreSQL connection")
+    end
+    connection
+  end
+
+  def closed? : Bool
+    @closed
+  end
+
+  # The connection to the server, replaced on every reconnect.
+  def connection : PGConnection
+    @conn
+  end
+
+  # Streams here until `#close`: crystal-pg's `blocking: true`.
+  def run : Nil
+    group do |g|
+      @tasks = g
+      # Periodically tell the server how far we've gotten so it can release WAL
+      # segments we've already processed and keep the connection alive.
+      g.spawn do
+        keepalive_loop
+        0
+      end
+      g.spawn do
+        run_loop
+        0
+      end
+      nil
+    end
+    @tasks = nil
+    # A cancelled group ends the tasks without `#close`; the connection is
+    # not left open behind them.
+    close
+  end
+
+  # Streams in a task of *group* until `#close`: crystal-pg's default.
+  def start(group : IyiGroup) : Nil
+    group.spawn do
+      run
+      0
+    end
+    nil
+  end
+
+  private def keepalive_loop : Nil
+    while !closed?
+      break if sleep(milliseconds(keepalive_interval)).is_a?(Cancelled)
+      break if closed?
+      # A failure means the connection dropped out from under us. `run_loop`
+      # handles reconnection, so just skip this round.
+      send_keepalive
+    end
+  end
+
+  # Consume the replication stream, reconnecting (and resuming from the last
+  # flushed WAL position) whenever the connection drops, until `#close` is
+  # called.
+  private def run_loop : Nil
+    backoff = BASE_RECONNECT_BACKOFF
+    while !closed?
+      result = @conn.listen_replication(publication_name, slot_name, last_wal_byte_flushed) do |frame|
+        received(frame)
+      end
+      # `listen_replication` only returns when the socket is closed. If we
+      # didn't close it ourselves, treat it as a drop and reconnect.
+      break if closed?
+      case result
+      when StreamError
+        LOG.warn("Replication connection lost; reconnecting: #{result.message}")
+      when DBError
+        LOG.error("Unexpected error in replication loop; reconnecting: #{result.message}")
+      else
+        LOG.warn("Replication connection lost; reconnecting")
+      end
+
+      # The connection dropped. Re-establish it, backing off if the server
+      # isn't ready yet.
+      while !closed?
+        # Cancelled: the group is stopping, and with it this task.
+        return if sleep(milliseconds(backoff)).is_a?(Cancelled)
+        break if closed?
+        reconnected = reconnect
+        if reconnected.is_a?(DBError)
+          backoff = backoff + backoff
+          backoff = MAX_RECONNECT_BACKOFF if backoff > MAX_RECONNECT_BACKOFF
+          LOG.error("Failed to reconnect replication; retrying in #{backoff.total_seconds}s: #{reconnected.message}")
+        else
+          backoff = BASE_RECONNECT_BACKOFF
+          break
+        end
+      end
+    end
+  end
+
+  private def reconnect : Nil | DBError
+    @conn.close
+    @conn = Connection.connect(@url)!
+    nil
+  end
+
+  private def milliseconds(span : Span) : Int32
+    span.total_milliseconds.to_i32
+  end
+
+  # Hands *frame* to the overload for its type.
+  def received(frame : Frame) : Nil
+    case frame
+    when CopyData   then received(frame)
+    when CopyBoth   then received(frame)
+    when ErrorFrame then received(frame)
+    else
+      nil
+    end
+  end
+
+  # :nodoc:
+  def received(frame : CopyBoth) : Nil
+  end
+
+  # :nodoc:
+  def received(frame : CopyData) : Nil
+    data = frame.data
+    case data
+    in XLogData          then received(data)
+    in KeepAlive         then received(data)
+    in KeepAliveResponse then received(data)
+    end
+  end
+
+  def received(frame : ErrorFrame) : Nil
+  end
+
+  # Handle the `XLogData` message that wraps `WALMessage`s
+  def received(data : XLogData) : Nil
+    @last_wal_byte_received = data.wal_end
+    handler.received(data, self) do
+      dispatch(data.message)
+    end
+  end
+
+  # :nodoc:
+  def received(keepalive : KeepAlive) : Nil
+    # A failed write is a dropped connection, which the next read reports.
+    send_keepalive if keepalive.response_expected?
+    nil
+  end
+
+  # This shouldn't ever be received, but it can be represented in memory so we
+  # need to include it for completeness.
+  def received(response : KeepAliveResponse) : Nil
+    raise "KeepAliveResponses are intended to be sent, not received"
+  end
+
+  # crystal-pg's `handler.received data.message` chose the overload by the
+  # message's runtime type; the `case` says which, here.
+  private def dispatch(message : WALMessage) : Nil
+    case message
+    when Begin    then handler.received(message)
+    when Commit   then handler.received(message)
+    when Origin   then handler.received(message)
+    when Relation then handler.received(message)
+    when Type     then handler.received(message)
+    when Insert   then handler.received(message)
+    when Update   then handler.received(message)
+    when Delete   then handler.received(message)
+    when Truncate then handler.received(message)
+    when Message  then handler.received(message)
+    else
+      nil
+    end
+  end
+
+  def close : Nil
+    return if closed?
+    # Flag the shutdown first so `run_loop` treats the imminent socket close
+    # as deliberate rather than a dropped connection to reconnect.
+    @closed = true
+    # We attempt to send off one last keepalive to let the server know where
+    # we left off.
+    send_keepalive
+    @conn.close
+    # Wakes the keepalive task from its sleep, and the run loop from a
+    # backoff or a read.
+    if tasks = @tasks
+      tasks.cancel_children
+    end
+    nil
+  end
+
+  def send_keepalive : Nil | DBError
+    CopyData.new(
+      StandbyStatusUpdate.new(
+        last_wal_byte_received: last_wal_byte_received,
+        last_wal_byte_flushed: last_wal_byte_flushed,
+        last_wal_byte_applied: last_wal_byte_applied,
+      )
+    ).to_io(socket)!
+    socket.flush
+  end
+
+  private def socket : Stream
+    @conn.connection.soc
+  end
+end

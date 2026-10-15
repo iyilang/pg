@@ -20,6 +20,10 @@ import pg/pq/conninfo::{ConnInfo}
 import pg/pq/frame::*
 import pg/pq/param::{Param}
 import pg/pq/scram::{SaslContext, md5_password}
+import pg/pq/pgpass::{LOG}
+# Imported unnamed: its `Frame` is not `pg/pq/frame`'s, so it is written
+# out in full below.
+import pg/replication/messages
 
 pub class PQConnection
   getter stream : Stream
@@ -485,5 +489,31 @@ pub class PQConnection
     @stream.write_char('c')
     @stream.write_i32(4)
     @stream.flush
+  end
+
+  # Starts logical replication from *slot_name* at *start_lsn*, for the
+  # publication *publication_name*, and hands every frame the server
+  # streams to *block* until the socket is closed. A frame that cannot be
+  # parsed is logged and skipped, as crystal-pg did; a socket that fails
+  # while still open is answered as its `StreamError`.
+  def start_replication_frame_loop(publication_name : String, slot_name : String, start_lsn : Int64 = 0_i64, &block : ::Pg::Replication::Messages::Frame -> Nil) : Nil | DBError
+    lsn = "#{(start_lsn >> 32).to_s(16).upcase}/#{(start_lsn & 0xFFFF_FFFF_i64).to_s(16).upcase}"
+    command = "START_REPLICATION SLOT #{slot_name} LOGICAL #{lsn} (proto_version '1', binary 'true', publication_names '#{publication_name}')"
+    send_query_message(command)!
+    while true
+      break if @stream.closed?
+      frame = ::Pg::Replication::Messages::Frame.from_io(@stream)
+      case frame
+      when StreamError
+        break if @stream.closed?
+        return frame
+      when DBError
+        reason = frame.message
+        LOG.error { "Replication frame: #{reason}" }
+      else
+        block.call(frame)
+      end
+    end
+    nil
   end
 end

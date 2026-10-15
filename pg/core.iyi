@@ -32,6 +32,8 @@ import pg/decoder::{Decoder, Decoders, UUIDValue, JSONValue}
 import pg/record::{Record}
 import pg/escape::{EscapeHelper}
 import pg/copy_result::{CopyResult}
+# Imported unnamed: its `Frame` is not `pg/pq/frame`'s.
+import pg/replication/messages
 
 pub class PGResultSet < ResultSet
   getter rows_affected : Int64
@@ -480,6 +482,22 @@ pub class PGConnection < Connection
   # `on_notification` callback.
   def listen_loop : Nil | DBError
     @connection.read_async_frame_loop
+  end
+
+  # Streams logical replication from *slot_name* for the publication
+  # *publication_name*, starting at *start_lsn*, handing each frame to
+  # *block* until the connection is closed. The connection must have been
+  # opened with `replication=database`. crystal-pg's `blocking: true`; it
+  # was `protected` there, for `Pg::Replication::Connection`, which is
+  # another class here.
+  def listen_replication(publication_name : String, slot_name : String, start_lsn : Int64 = 0_i64, &block : ::Pg::Replication::Messages::Frame -> Nil) : Nil | DBError
+    @connection.start_replication_frame_loop(publication_name, slot_name, start_lsn, &block)
+  end
+
+  # The same, read in a task of *group*: crystal-pg's `blocking: false`,
+  # whose fiber is a task of the caller's group here (SPEC.md III.4.1).
+  def listen_replication(publication_name : String, slot_name : String, start_lsn : Int64, group : IyiGroup, &block : ::Pg::Replication::Messages::Frame -> Nil) : IyiTask(Nil | DBError)
+    group.spawn { @connection.start_replication_frame_loop(publication_name, slot_name, start_lsn, &block) }
   end
 
   # The server's version, from its `server_version` parameter.

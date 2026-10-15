@@ -1,0 +1,618 @@
+# The messages of PostgreSQL's streaming replication protocol and of the
+# `pgoutput` logical replication protocol (version 1): crystal-pg's
+# `src/pg/replication/*.cr`.
+#
+# https://www.postgresql.org/docs/current/protocol-replication.html
+# https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
+#
+# crystal-pg gives each type a file of its own. `Frame.from_io` names the
+# frames and the frames name the messages, and an iyi module cannot be
+# named like a type its importers use (`pg/replication/frame` would shadow
+# `Frame` everywhere under `Pg::Replication`), so they share this module.
+#
+# Every parser answers `X | DBError` where crystal-pg raised: `StreamError`
+# when the bytes run out, `PGError` (crystal-pg's `PG::Error`) for a byte
+# the protocol does not allow.
+module pg/replication/messages
+
+import std/int
+import std/text
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import db/db/errors::{DBError}
+import pg/pq/stream::{ByteSource, MemorySource, Stream}
+import pg/errors::{PGError}
+
+# Times on the wire are microseconds since 2000-01-01 UTC.
+pub class TimeParser
+  EPOCH = Time.utc(2000, 1, 1)
+
+  def self.call(io : ByteSource) : Time | DBError
+    call(io.read_i64!)
+  end
+
+  def self.call(microseconds : Int64) : Time
+    EPOCH + Span.new(seconds: microseconds // 1_000_000, nanoseconds: (microseconds % 1_000_000) * 1_000)
+  end
+
+  # The microseconds since 2000-01-01 UTC of *time*: what `call` reads.
+  def self.microseconds(time : Time) : Int64
+    span = time - EPOCH
+    span.total_seconds_i64 * 1_000_000_i64 + span.nanoseconds // 1_000
+  end
+end
+
+# crystal-pg's `Read` mixin: the reads every message shares, as class
+# methods because a message is parsed by a factory, before an instance
+# exists (an iyi constructor cannot answer an error).
+pub class Read
+  def self.read_i8(io : ByteSource) : Int8 | DBError
+    io.read_byte!.unsafe_to_i8
+  end
+
+  # A NUL-terminated string.
+  def self.read_string(io : ByteSource) : String | DBError
+    bytes = [] of UInt8
+    while true
+      byte = io.read_byte!
+      break if byte == 0_u8
+      bytes << byte
+    end
+    String.new(bytes.size) do |buffer|
+      bytes.each_with_index { |b, i| buffer[i] = b }
+    end
+  end
+
+  # An Int32 length, then that many bytes.
+  def self.read_bytes(io : ByteSource) : Bytes | DBError
+    io.read_bytes(io.read_i32!)
+  end
+
+  def self.read_time(io : ByteSource) : Time | DBError
+    TimeParser.call(io)
+  end
+
+  # The error for a marker byte the protocol does not allow at this point.
+  def self.unexpected(what : String, byte : UInt8) : PGError
+    PGError.new("#{what}: 0x#{byte.to_s(16)} (#{byte.unsafe_chr.inspect})")
+  end
+
+  # The body of a message whose Int32 length (itself included) comes next,
+  # read whole so a parse that fails leaves the stream at the next message.
+  def self.read_body(io : ByteSource) : MemorySource | DBError
+    size = io.read_i32!
+    MemorySource.new(io.read_bytes(size - 4)!)
+  end
+end
+
+# ---------------------------------------------------------------- frames
+
+# A message the server sends on a connection in `START_REPLICATION`'s
+# copy-both mode.
+pub abstract class Frame
+  # Crystal-pg left the stream inside an unknown message when it raised;
+  # here its body is skipped first, so the loop reading frames can log the
+  # error and go on with the next one.
+  def self.from_io(io : ByteSource) : Frame | DBError
+    byte = io.read_byte!
+    case byte
+    when 'W'.ord then CopyBoth.from_io(io)
+    when 'd'.ord then CopyData.from_io(io)
+    when 'E'.ord then ErrorFrame.from_io(io)
+    else
+      Read.read_body(io)!
+      Read.unexpected("Unexpected byte marker", byte)
+    end
+  end
+end
+
+# `CopyBothResponse`: the server is streaming.
+pub class CopyBoth < Frame
+  enum Format : Int8
+    Text   = 0
+    Binary = 1
+  end
+
+  getter format : Format
+  getter column_formats : Array(Int16)
+
+  def initialize(@format : Format, @column_formats : Array(Int16))
+  end
+
+  def self.from_io(io : ByteSource) : CopyBoth | DBError
+    sized = Read.read_body(io)!
+    format = Format.new(Read.read_i8(sized)!)
+    column_count = sized.read_i16!
+    column_formats = [] of Int16
+    index = 0
+    while index < column_count
+      column_formats << sized.read_i16!
+      index += 1
+    end
+    CopyBoth.new(format, column_formats)
+  end
+end
+
+# `CopyData`: one message of the stream, or the client's status update.
+pub class CopyData < Frame
+  getter data : XLogData | KeepAlive | KeepAliveResponse
+
+  def initialize(@data : XLogData | KeepAlive | KeepAliveResponse)
+  end
+
+  # The body is read whole first (crystal-pg parsed straight off the
+  # socket), so a message this driver cannot parse costs only itself.
+  def self.from_io(io : ByteSource) : CopyData | DBError
+    body = Read.read_body(io)!
+    byte = body.read_byte!
+    case byte
+    when 'w'.ord then CopyData.new(XLogData.from_io(body)!)
+    when 'k'.ord then CopyData.new(KeepAlive.from_io(body)!)
+    else
+      Read.unexpected("Unexpected CopyData byte marker", byte)
+    end
+  end
+
+  # Writes the message to *io*; flushing is the caller's. Only a
+  # `KeepAliveResponse` is the client's to send: the others answer an
+  # error, where crystal-pg raised `NotImplementedError`.
+  def to_io(io : Stream) : Nil | DBError
+    data = @data
+    case data
+    in KeepAliveResponse
+      io.write_char('d')
+      io.write_i32(data.bytesize + 4)
+      data.to_io(io)
+      nil
+    in XLogData
+      data.to_io(io)
+    in KeepAlive
+      data.to_io(io)
+    end
+  end
+end
+
+# The severity of an `ErrorFrame`.
+pub enum Severity
+  LOG
+  INFO
+  DEBUG
+  NOTICE
+  WARNING
+  ERROR
+  FATAL
+  PANIC
+end
+
+# `ErrorResponse`, by its fields.
+pub class ErrorFrame < Frame
+  # Nil when the server sent none, or a localized one (`lc_messages`) that
+  # is not one of `Severity`'s names, where crystal-pg's `Severity.parse`
+  # raised.
+  getter severity : Severity?
+  getter message : String?
+  getter detail : String?
+  getter hint : String?
+  getter misc : Array(Tuple(Char, String))
+
+  def initialize(@severity : Severity?, @message : String?, @detail : String?, @hint : String?, @misc : Array(Tuple(Char, String)))
+  end
+
+  def self.from_io(io : ByteSource) : ErrorFrame | DBError
+    body = Read.read_body(io)!
+    severity = nil.as(Severity?)
+    message = nil.as(String?)
+    detail = nil.as(String?)
+    hint = nil.as(String?)
+    misc = [] of Tuple(Char, String)
+    while true
+      byte = body.read_byte!
+      break if byte == 0_u8
+      case byte
+      when 'S'.ord then severity = Severity.parse?(Read.read_string(body)!)
+      when 'M'.ord then message = Read.read_string(body)!
+      when 'D'.ord then detail = Read.read_string(body)!
+      when 'H'.ord then hint = Read.read_string(body)!
+      else
+        misc << {byte.unsafe_chr, Read.read_string(body)!}
+      end
+    end
+    ErrorFrame.new(severity, message, detail, hint, misc)
+  end
+end
+
+# ------------------------------------------------------- copy data payloads
+
+# `XLogData`: WAL data, here a logical replication message.
+pub class XLogData
+  getter wal_start : Int64
+  getter wal_end : Int64
+  getter timestamp : Time
+  getter message : WALMessage
+
+  def initialize(@wal_start : Int64, @wal_end : Int64, @timestamp : Time, @message : WALMessage)
+  end
+
+  def self.from_io(io : ByteSource) : XLogData | DBError
+    wal_start = io.read_i64!
+    wal_end = io.read_i64!
+    timestamp = TimeParser.call(io)!
+    message = WALMessage.from_io(io)!
+    XLogData.new(wal_start, wal_end, timestamp, message)
+  end
+
+  def to_io(io : Stream) : Nil | DBError
+    PGError.new("XLogData messages are meant to be sent by the server, not received by the client")
+  end
+end
+
+# The server's keepalive.
+pub class KeepAlive
+  getter wal_end : Int64
+  getter timestamp : Time
+  @response_expected : Bool
+
+  def initialize(@wal_end : Int64, @timestamp : Time, @response_expected : Bool)
+  end
+
+  # Whether the server asks for a `StandbyStatusUpdate` straight away.
+  def response_expected? : Bool
+    @response_expected
+  end
+
+  def self.from_io(io : ByteSource) : KeepAlive | DBError
+    wal_end = io.read_i64!
+    timestamp = TimeParser.call(io)!
+    response_expected = io.read_byte! == 1_u8
+    KeepAlive.new(wal_end, timestamp, response_expected)
+  end
+
+  def to_io(io : Stream) : Nil | DBError
+    PGError.new("KeepAlives are intended to be received from the server, not sent to it")
+  end
+end
+
+# What the client answers a `KeepAlive` with.
+pub abstract class KeepAliveResponse
+  # The bytes `to_io` writes: `CopyData` writes its length first, which
+  # crystal-pg learned by writing the payload to an `IO::Memory`.
+  abstract def bytesize : Int32
+
+  abstract def to_io(io : Stream) : Nil
+end
+
+# The client's report of how far it has received, flushed and applied the
+# WAL.
+pub class StandbyStatusUpdate < KeepAliveResponse
+  getter last_wal_byte_received : Int64
+  getter last_wal_byte_flushed : Int64
+  getter last_wal_byte_applied : Int64
+  getter timestamp : Time
+  @response_expected : Bool
+
+  def initialize(@last_wal_byte_received : Int64, @last_wal_byte_flushed : Int64, @last_wal_byte_applied : Int64, *, @timestamp : Time = Time.utc, @response_expected : Bool = false)
+  end
+
+  # Whether the server is asked to answer with a `KeepAlive` at once.
+  def response_expected? : Bool
+    @response_expected
+  end
+
+  def bytesize : Int32
+    1 + 8 + 8 + 8 + 8 + 1
+  end
+
+  def to_io(io : Stream) : Nil
+    io.write_char('r')
+    io.write_i64(last_wal_byte_received)
+    io.write_i64(last_wal_byte_flushed)
+    io.write_i64(last_wal_byte_applied)
+    io.write_i64(TimeParser.microseconds(@timestamp))
+    io.write_byte(response_expected? ? 1_u8 : 0_u8)
+  end
+end
+
+# -------------------------------------------------- logical replication
+
+# A TOASTed value the update left unchanged: the server does not send it.
+pub struct UnchangedTOASTValue
+  def ==(other : UnchangedTOASTValue) : Bool
+    true
+  end
+end
+
+# A message of the `pgoutput` logical replication protocol, version 1.
+pub abstract class WALMessage
+  alias TupleData = Array(UnchangedTOASTValue | Bytes | String | Nil)
+
+  def self.from_io(io : ByteSource) : WALMessage | DBError
+    byte = io.read_byte!
+    case byte
+    when 'B'.ord then Begin.from_io(io)
+    when 'C'.ord then Commit.from_io(io)
+    when 'R'.ord then Relation.from_io(io)
+    when 'I'.ord then Insert.from_io(io)
+    when 'U'.ord then Update.from_io(io)
+    when 'D'.ord then Delete.from_io(io)
+    when 'T'.ord then Truncate.from_io(io)
+    when 'Y'.ord then Type.from_io(io)
+    when 'M'.ord then Message.from_io(io)
+    when 'O'.ord then Origin.from_io(io)
+    else
+      Read.unexpected("Unexpected WAL message byte marker", byte)
+    end
+  end
+
+  # crystal-pg read a `'t'` (text) value as a NUL-terminated string; the
+  # protocol sends an Int32 length and the text, as for `'b'`, so that is
+  # what is read here.
+  def self.read_tuple_data(io : ByteSource) : TupleData | DBError
+    column_count = io.read_i16!
+    data = TupleData.new
+    index = 0
+    while index < column_count
+      byte = io.read_byte!
+      case byte
+      when 'n'.ord then data << nil
+      when 'u'.ord then data << UnchangedTOASTValue.new
+      when 't'.ord
+        size = io.read_i32!
+        data << io.read_string(size)!
+      when 'b'.ord then data << Read.read_bytes(io)!
+      else
+        return Read.unexpected("Unexpected TupleData byte marker", byte)
+      end
+      index += 1
+    end
+    data
+  end
+end
+
+pub class Begin < WALMessage
+  getter final_lsn : Int64
+  getter timestamp : Time
+  getter transaction_id : Int32
+
+  def initialize(@final_lsn : Int64, @timestamp : Time, @transaction_id : Int32)
+  end
+
+  def self.from_io(io : ByteSource) : Begin | DBError
+    final_lsn = io.read_i64!
+    timestamp = TimeParser.call(io)!
+    transaction_id = io.read_i32!
+    Begin.new(final_lsn, timestamp, transaction_id)
+  end
+end
+
+pub class Commit < WALMessage
+  getter flags : Int8
+  getter begin_lsn : Int64
+  getter end_lsn : Int64
+  getter timestamp : Time
+
+  def initialize(@flags : Int8, @begin_lsn : Int64, @end_lsn : Int64, @timestamp : Time)
+  end
+
+  def self.from_io(io : ByteSource) : Commit | DBError
+    flags = Read.read_i8(io)!
+    begin_lsn = io.read_i64!
+    end_lsn = io.read_i64!
+    timestamp = Read.read_time(io)!
+    Commit.new(flags, begin_lsn, end_lsn, timestamp)
+  end
+end
+
+pub class Origin < WALMessage
+  getter lsn : Int64
+  getter name : String
+
+  def initialize(@lsn : Int64, @name : String)
+  end
+
+  def self.from_io(io : ByteSource) : Origin | DBError
+    lsn = io.read_i64!
+    name = Read.read_string(io)!
+    Origin.new(lsn, name)
+  end
+end
+
+pub class Relation < WALMessage
+  @[Flags]
+  enum Flags
+    Key = 1
+  end
+
+  struct Column
+    getter flags : Flags
+    getter name : String
+    getter oid : Int32
+    getter type_modifier : Int32
+
+    def initialize(@flags : Flags, @name : String, @oid : Int32, @type_modifier : Int32)
+    end
+  end
+
+  # Requires proto_version >= 2
+  # getter transaction_id : Int32
+  getter oid : Int32
+  getter namespace : String
+  getter name : String
+  getter replica_identity : Int8
+  getter columns : Array(Column)
+
+  def initialize(@oid : Int32, @namespace : String, @name : String, @replica_identity : Int8, @columns : Array(Column))
+  end
+
+  def self.from_io(io : ByteSource) : Relation | DBError
+    oid = io.read_i32!
+    namespace = Read.read_string(io)!
+    name = Read.read_string(io)!
+    replica_identity = Read.read_i8(io)!
+    column_count = io.read_i16!
+    columns = [] of Column
+    index = 0
+    while index < column_count
+      flags = Flags.new(Read.read_i8(io)!.to_i32)
+      column_name = Read.read_string(io)!
+      column_oid = io.read_i32!
+      type_modifier = io.read_i32!
+      columns << Column.new(flags, column_name, column_oid, type_modifier)
+      index += 1
+    end
+    Relation.new(oid, namespace, name, replica_identity, columns)
+  end
+end
+
+pub class Type < WALMessage
+  # getter transaction_id : Int32
+  getter oid : Int32
+  getter namespace : String
+  getter data_type : String
+
+  def initialize(@oid : Int32, @namespace : String, @data_type : String)
+  end
+
+  def self.from_io(io : ByteSource) : Type | DBError
+    oid = io.read_i32!
+    namespace = Read.read_string(io)!
+    data_type = Read.read_string(io)!
+    Type.new(oid, namespace, data_type)
+  end
+end
+
+pub class Insert < WALMessage
+  # getter transaction_id : Int32
+  getter oid : Int32
+  getter tuple_data : TupleData
+
+  def initialize(@oid : Int32, @tuple_data : TupleData)
+  end
+
+  def self.from_io(io : ByteSource) : Insert | DBError
+    # Only included in WAL protocol v2+
+    # @transaction_id = read(io, Int32)
+    oid = io.read_i32!
+    # This is an 'N' indicating a new tuple
+    io.read_byte!
+    Insert.new(oid, read_tuple_data(io)!)
+  end
+end
+
+pub class Update < WALMessage
+  getter oid : Int32
+  getter key_tuple_data : TupleData?
+  getter old_tuple_data : TupleData?
+  getter new_tuple_data : TupleData
+
+  def initialize(@oid : Int32, @key_tuple_data : TupleData?, @old_tuple_data : TupleData?, @new_tuple_data : TupleData)
+  end
+
+  def self.from_io(io : ByteSource) : Update | DBError
+    oid = io.read_i32!
+    key_tuple_data = nil.as(TupleData?)
+    old_tuple_data = nil.as(TupleData?)
+    new_tuple_data = nil.as(TupleData?)
+    submessage_type = io.read_byte!
+    case submessage_type
+    when 'K'.ord then key_tuple_data = read_tuple_data(io)!
+    when 'O'.ord then old_tuple_data = read_tuple_data(io)!
+    when 'N'.ord then new_tuple_data = read_tuple_data(io)!
+    else
+      # crystal-pg went on to expect the new tuple's marker
+    end
+
+    # If either 'K' or 'O' were specified above, then the next value is our
+    # new tuple. Otherwise, that was our new tuple, so we just assign it.
+    if new_tuple_data.nil?
+      byte = io.read_byte!
+      if byte == 'N'.ord
+        new_tuple_data = read_tuple_data(io)!
+      else
+        return Read.unexpected("Expected new TupleData byte marker, got", byte)
+      end
+    end
+    Update.new(oid, key_tuple_data, old_tuple_data, new_tuple_data)
+  end
+end
+
+pub class Delete < WALMessage
+  # getter transaction_id : Int32
+  getter oid : Int32
+  getter key_tuple_data : TupleData?
+  getter old_tuple_data : TupleData?
+
+  def initialize(@oid : Int32, @key_tuple_data : TupleData?, @old_tuple_data : TupleData?)
+  end
+
+  def self.from_io(io : ByteSource) : Delete | DBError
+    # @transaction_id = read(io, Int32) # Requires proto_version >= 2
+    oid = io.read_i32!
+    byte = io.read_byte!
+    case byte
+    when 'K'.ord then Delete.new(oid, read_tuple_data(io)!, nil)
+    when 'O'.ord then Delete.new(oid, nil, read_tuple_data(io)!)
+    else
+      Read.unexpected("Expected new TupleData byte marker, got", byte)
+    end
+  end
+end
+
+pub class Truncate < WALMessage
+  @[Flags]
+  enum Options : Int8
+    CASCADE          = 1
+    RESTART_IDENTITY = 2
+  end
+
+  # transaction_id requires proto_version >= 2
+  # getter transaction_id : Int32
+  getter options : Options
+  getter relation_oids : Array(Int32)
+
+  def initialize(@options : Options, @relation_oids : Array(Int32))
+  end
+
+  def self.from_io(io : ByteSource) : Truncate | DBError
+    # @transaction_id = read(io, Int32) # Requires proto_version >= 2
+    relation_count = io.read_i32!
+    options = Options.new(Read.read_i8(io)!)
+    relation_oids = [] of Int32
+    index = 0
+    while index < relation_count
+      relation_oids << io.read_i32!
+      index += 1
+    end
+    Truncate.new(options, relation_oids)
+  end
+end
+
+pub class Message < WALMessage
+  @[Flags]
+  enum Flags : Int8
+    Transactional = 1
+  end
+
+  # Requires proto_version >= 2
+  # getter transaction_id : Int32
+  getter flags : Flags
+  getter lsn : Int64
+  getter prefix : String
+  getter content : Bytes
+
+  def initialize(@flags : Flags, @lsn : Int64, @prefix : String, @content : Bytes)
+  end
+
+  def self.from_io(io : ByteSource) : Message | DBError
+    # @transaction_id = read(io, Int32) # Requires proto_version >= 2
+    flags = Flags.new(Read.read_i8(io)!)
+    lsn = io.read_i64!
+    prefix = Read.read_string(io)!
+    content = Read.read_bytes(io)!
+    Message.new(flags, lsn, prefix, content)
+  end
+end
+
+# Only `proto_version` 1 is spoken (`PQConnection#start_replication_frame_loop`
+# asks for it), as in crystal-pg: StreamStart, StreamStop, StreamCommit and
+# StreamAbort need proto_version >= 2; BeginPrepare, Prepare, CommitPrepared,
+# RollbackPrepared and StreamPrepare need proto_version >= 3.

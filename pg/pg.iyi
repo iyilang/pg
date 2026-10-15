@@ -22,6 +22,8 @@ import db/db/errors::{DBError}
 import db/db/core::{Database}
 import pg/pq/frame::{Notification}
 import pg/core::{PGConnection}
+import std/time::{Span}
+import pg/replication::{Handler}
 
 pub VERSION = "0.1.0"
 
@@ -62,6 +64,39 @@ end
 pub def connect_listen(url : String, channels : Array(String), &blk : Notification -> Nil) : Nil | DBError
   conn = ListenConnection.open(url, channels, &blk)!
   conn.listen
+end
+
+# Establish a logical replication connection that streams the changes of
+# the publication *publication_name* from the replication slot *slot_name*
+# to *handler*, in a task of *group*, until it is closed. The server must
+# run with `wal_level = logical`.
+#
+# ```
+# group do |g|
+#   conn = Pg::Pg.connect_replication(ENV["DATABASE_URL"],
+#     handler: MyHandler.new,
+#     publication_name: "my_publication",
+#     slot_name: "my_replication_slot",
+#     group: g)!
+#   # ...
+#   conn.close
+# end
+# ```
+#
+# As for `connect_listen`, the group is the caller's because an iyi task
+# cannot outlive it (SPEC.md III.4.1).
+pub def connect_replication(url : String, *, handler : Handler, publication_name : String, slot_name : String, keepalive_interval : Span = Span.seconds(10), group : IyiGroup) : ::Pg::Replication::Connection | DBError
+  conn = ::Pg::Replication::Connection.open(url, handler, publication_name: publication_name, slot_name: slot_name, keepalive_interval: keepalive_interval)!
+  conn.start(group)
+  conn
+end
+
+# The same, streaming here until the connection is closed: the handler's
+# `received(data, connection)` is given the connection to close.
+# crystal-pg's `Replication::Connection.new(..., blocking: true)`.
+pub def connect_replication(url : String, *, handler : Handler, publication_name : String, slot_name : String, keepalive_interval : Span = Span.seconds(10)) : Nil | DBError
+  conn = ::Pg::Replication::Connection.open(url, handler, publication_name: publication_name, slot_name: slot_name, keepalive_interval: keepalive_interval)!
+  conn.run
 end
 
 # A connection that only `LISTEN`s.
