@@ -1,0 +1,63 @@
+# What the tests share: crystal-pg's `spec/spec_helper.cr`.
+#
+# The database is `DATABASE_URL`'s, `postgres:///` by default, which takes
+# the user, password, host and database from the `PG*` variables.
+module pg/testing/spec_helper
+
+import std/env
+import db/db/db
+import db/db/core::{Database, Connection}
+import db/db/errors::{DBError}
+import pg/core::{PGConnection}
+
+pub DB_URL = ENV["DATABASE_URL"]? || "postgres:///"
+
+# A pool every test may use.
+pub PG_DB = ::Db::Db.open(DB_URL).or_panic
+
+pub def with_db(& : Database -> Nil) : Nil
+  ::Db::Db.open(DB_URL) { |db| yield db }.or_panic
+end
+
+pub def with_connection(& : PGConnection -> Nil) : Nil
+  ::Db::Db.connect(DB_URL) { |conn| yield conn.as(PGConnection) }.or_panic
+end
+
+pub def escape_literal(string : String) : String
+  result = ""
+  with_connection { |conn| result = conn.escape_literal(string) }
+  result
+end
+
+pub def escape_identifier(string : String) : String
+  result = ""
+  with_connection { |conn| result = conn.escape_identifier(string) }
+  result
+end
+
+# Whether the server is at least *major*.*minor*.*patch*.
+pub def db_version_gte(major : Int32, minor : Int32 = 0, patch : Int32 = 0) : Bool
+  ver = {major: 0, minor: 0, patch: 0}
+  with_connection { |conn| ver = conn.version }
+  ver[:major] >= major && ver[:minor] >= minor && ver[:patch] >= patch
+end
+
+ENV_VARS = ["PGDATABASE", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGPASSFILE", "PGAPPNAME"]
+
+# Runs the block without the `PG*` variables, and puts them back after.
+pub def env_var_bubble(& : -> Nil) : Nil
+  orig_vals = {} of String => String
+  ENV_VARS.each do |var|
+    if value = ENV[var]?
+      orig_vals[var] = value
+      ENV.delete(var)
+    end
+  end
+  defer ENV_VARS.each { |var|
+    ENV.delete(var)
+    if value = orig_vals[var]?
+      ENV[var] = value
+    end
+  }
+  yield
+end
