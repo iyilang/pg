@@ -1,0 +1,149 @@
+# crystal-pg's spec/pg/decoders/array_decoder_spec.cr.
+module pg/array_decoder_test
+
+import std/int
+import std/float
+import std/time::{Time}
+import std/uuid::{UUID}
+import db/db/errors::*
+import db/db/value::{DBValue, CustomValue}
+import db/db/spec::{describe, it, expect_error}
+import pg/errors::{RuntimeError}
+import pg/decoder::{UUIDValue}
+import pg/numeric::{Numeric}
+import pg/testing/spec_helper::*
+
+# Whether *a* and *b* are the same value of the same type, element by
+# element: a plain `read` of an array answers nested `Array(DBValue)`s.
+# Types are compared by name, here and in the `typeof` checks below: iyi's
+# `Class` has no `==` (`String == String` is false in iyi 0.17.0).
+def same?(a : DBValue, b : DBValue) : Bool
+  if a.is_a?(Array(DBValue)) && b.is_a?(Array(DBValue))
+    return false unless a.size == b.size
+    a.each_with_index { |x, i| return false unless same?(x, b[i]) }
+    return true
+  end
+  a.class.to_s == b.class.to_s && a == b
+end
+
+# Selects *query* and checks that a plain `read` answers *expected*.
+def test_decode(name : String, query : String, expected : DBValue) : Nil
+  it name do
+    value = PG_DB.query_one("select #{query}") { |rs| rs.read }.or_panic
+    assert same?(value, expected), "#{query}: expected #{expected.inspect}, got #{value.inspect}"
+  end
+end
+
+describe "PG::Decoders" do
+  test_decode "array", "'{}'::integer[]", [] of DBValue
+  test_decode "array", "ARRAY[9]", [9] of DBValue
+  test_decode "array", "ARRAY[8,9]", [8, 9] of DBValue
+  test_decode "array", "'{{9,8},{7,6},{5,4}}'::integer[]",
+    [[9, 8] of DBValue, [7, 6] of DBValue, [5, 4] of DBValue] of DBValue
+  test_decode "array", "'{ {9,8,7}, {6,5,4} }'::integer[] ",
+    [[9, 8, 7] of DBValue, [6, 5, 4] of DBValue] of DBValue
+  test_decode "array", "'{{{1,2},{3,4}},{{9,8},{7,6}}}'::integer[]",
+    [
+      [[1, 2] of DBValue, [3, 4] of DBValue] of DBValue,
+      [[9, 8] of DBValue, [7, 6] of DBValue] of DBValue,
+    ] of DBValue
+  test_decode "array", "ARRAY[1, null, 2] ", [1, nil, 2] of DBValue
+  test_decode "array", "('[3:5]={1,2,3}'::integer[])", [nil, nil, 1, 2, 3] of DBValue
+
+  it "allows special-case casting on simple arrays" do
+    value = PG_DB.query_one("select '{}'::integer[]") { |rs| rs.read(Array(Int32)) }.or_panic
+    assert typeof(value).to_s == (Array(Int32)).to_s
+    assert value.empty?
+
+    value = PG_DB.query_one("select '{1,2,3}'::integer[]") { |rs| rs.read(Array(Int32)) }.or_panic
+    assert typeof(value).to_s == (Array(Int32)).to_s
+    assert value == [1, 2, 3]
+
+    value2 = PG_DB.query_one("select '{1,2,3,null}'::integer[]") { |rs| rs.read(Array(Int32 | Nil)) }.or_panic
+    assert typeof(value2).to_s == (Array(Int32 | Nil)).to_s
+    assert value2 == [1, 2, 3, nil]
+
+    value3 = PG_DB.query_one("select '{{1,2,3},{4,5,6}}'::integer[]") { |rs| rs.read(Array(Array(Int32))) }.or_panic
+    assert typeof(value3).to_s == (Array(Array(Int32))).to_s
+    assert value3 == [[1, 2, 3], [4, 5, 6]]
+  end
+
+  it "reads array as nilable" do
+    value = PG_DB.query_one("select '{1,2,3}'::integer[]") { |rs| rs.read(Array(Int32) | Nil) }.or_panic
+    assert typeof(value).to_s == (Array(Int32) | Nil).to_s
+    assert value == [1, 2, 3]
+
+    value = PG_DB.query_one("select null") { |rs| rs.read(Array(Int32) | Nil) }.or_panic
+    assert typeof(value).to_s == (Array(Int32) | Nil).to_s
+    assert value.nil?
+  end
+
+  it "reads arrray of numeric" do
+    value = PG_DB.query_one("select '{1,2,3}'::numeric[]") { |rs| rs.read(Array(Numeric)) }.or_panic
+    assert typeof(value).to_s == (Array(Numeric)).to_s
+    assert value.map(&.to_f) == [1.0, 2.0, 3.0]
+  end
+
+  it "reads arrray of nilable numeric" do
+    value = PG_DB.query_one("select '{1,null,3}'::numeric[]") { |rs| rs.read(Array(Numeric | Nil)) }.or_panic
+    assert typeof(value).to_s == (Array(Numeric | Nil)).to_s
+    assert value.map { |n| n ? n.to_f : nil } == [1.0, nil, 3.0]
+  end
+
+  it "raises when reading null in non-null array" do
+    expect_error(PG_DB.query_one("select '{1,2,3,null}'::integer[]") { |rs| rs.read(Array(Int32)) }, RuntimeError)
+    nil
+  end
+
+  it "reads array of time" do
+    values = PG_DB.query_one("select array[to_date('20170103', 'YYYYMMDD')::timestamp]") { |rs| rs.read(Array(Time)) }.or_panic
+    assert typeof(values).to_s == (Array(Time)).to_s
+
+    assert values.size == 1
+    assert values[0] == Time.utc(2017, 1, 3)
+  end
+
+  it "reads array of date" do
+    values = PG_DB.query_one("select array[to_date('20170103', 'YYYYMMDD')]") { |rs| rs.read(Array(Time)) }.or_panic
+    assert typeof(values).to_s == (Array(Time)).to_s
+
+    assert values.size == 1
+    assert values[0] == Time.utc(2017, 1, 3)
+  end
+
+  it "reads array of uuid" do
+    values = PG_DB.query_one("select array['56d3839e-dbb6-4b51-aa67-c0bc2a78c9d4'::uuid]") { |rs| rs.read(Array(UUID)) }.or_panic
+    assert typeof(values).to_s == (Array(UUID)).to_s
+
+    assert values.size == 1
+    assert values[0] == UUID.parse("56d3839e-dbb6-4b51-aa67-c0bc2a78c9d4")
+  end
+
+  it "raises when reading incorrect array type" do
+    expect_error(PG_DB.query_one("select '{1,2,3}'::numeric[]") { |rs| rs.read(Array(Float64)) }, RuntimeError)
+    nil
+  end
+
+  it "errors on negative lower bounds" do
+    expect_error(PG_DB.query_one("select '[-2:-0]={1,2,3}'::integer[]") { |rs| rs.read }, RuntimeError)
+    nil
+  end
+
+  test_decode "bool array", "$${t,f,t}$$::bool[]", [true, false, true] of DBValue
+  test_decode "char array", "$${a, b}$$::\"char\"[]", ['a', 'b'] of DBValue
+  test_decode "int2 array", "$${1,2}$$::int2[]", [1_i16, 2_i16] of DBValue
+  test_decode "text array", "$${hello, world}$$::text[]", ["hello", "world"] of DBValue
+  test_decode "int8 array", "$${1,2}$$::int8[]", [1_i64, 2_i64] of DBValue
+  test_decode "float4 array", "$${1.1,2.2}$$::float4[]", [1.1_f32, 2.2_f32] of DBValue
+  test_decode "float8 array", "$${1.1,2.2}$$::float8[]", [1.1_f64, 2.2_f64] of DBValue
+  test_decode "date array", "array[to_date('20170103', 'YYYYMMDD')]", [Time.utc(2017, 1, 3)] of DBValue
+  test_decode "numeric array", "array[1::numeric]", [Numeric.new(ndigits: 1_i16, weight: 0_i16, sign: Numeric::Sign::Pos.value.to_i16, dscale: 0_i16, digits: [1_i16])] of DBValue
+  test_decode "time array", "array[to_date('20170103', 'YYYYMMDD')::timestamp]", [Time.utc(2017, 1, 3)] of DBValue
+  # a plain `read` answers `UUIDValue`s: `UUID` is not a `DBValue`
+  test_decode "uuid array", "array['f0c66172-f617-4bb4-95f4-5677a093cedb']::uuid[]", [UUIDValue.new(UUID.parse("f0c66172-f617-4bb4-95f4-5677a093cedb"))] of DBValue
+
+  it "errors when expecting array returns null" do
+    expect_error(PG_DB.query_one("SELECT NULL", as: Array(String)), RuntimeError, "unexpected NULL, expecting to read Array(String)")
+    nil
+  end
+end

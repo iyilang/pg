@@ -1,0 +1,149 @@
+# crystal-pg's spec/pg/decoder_spec.cr, with spec/spec_helper.cr's
+# `test_decode`.
+module pg/decoder_test
+
+import std/int
+import std/float
+import std/time::{Time}
+import std/slice::{Slice, Bytes}
+import std/uuid::{UUID}
+import db/db/errors::*
+import db/db/value::{DBValue, CustomValue}
+import db/db/spec::{describe, it}
+import pg/decoder::{UUIDValue, JSONValue}
+import pg/numeric::{Numeric}
+import pg/interval::{Interval}
+import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
+import pg/testing/spec_helper::*
+
+# Whether *a* and *b* are the same value of the same type: `1_i16` is not
+# `1`, as crystal's `eq` told an `Int16` from an `Int32` through the union.
+# The classes are compared by name: iyi's `Class` has no `==`
+# (`String == String` is false in iyi 0.17.0).
+def same?(a : DBValue, b : DBValue) : Bool
+  if a.is_a?(Array(DBValue)) && b.is_a?(Array(DBValue))
+    return false unless a.size == b.size
+    a.each_with_index { |x, i| return false unless same?(x, b[i]) }
+    return true
+  end
+  a.class.to_s == b.class.to_s && a == b
+end
+
+# Selects *query* and checks that a plain `read` answers *expected*.
+def test_decode(name : String, query : String, expected : DBValue) : Nil
+  it name do
+    value = PG_DB.query_one("select #{query}") { |rs| rs.read }.or_panic
+    assert same?(value, expected), "#{query}: expected #{expected.inspect}, got #{value.inspect}"
+  end
+end
+
+def bytes(values : Array(UInt8)) : Bytes
+  slice = Bytes.new(values.size)
+  values.each_with_index { |v, i| slice[i] = v }
+  slice
+end
+
+def uuid(text : String) : UUIDValue
+  UUIDValue.new(UUID.parse(text))
+end
+
+describe "PG::Decoders" do
+  #           name,             sql,              result
+  test_decode "undefined    ", "'what'         ", "what"
+  test_decode "text         ", "'what'::text   ", "what"
+  test_decode "varchar      ", "'wh'::varchar  ", "wh"
+  test_decode "empty strings", "''             ", ""
+  test_decode "null as nil  ", "null           ", nil
+  test_decode "boolean false", "false          ", false
+  test_decode "boolean true ", "true           ", true
+  test_decode "int2 smallint", "1::int2        ", 1_i16
+  test_decode "int2 smallint", "-1::int2       ", -1_i16
+  test_decode "int4 int     ", "1::int4        ", 1
+  test_decode "int4 int     ", "-1::int4       ", -1
+  test_decode "int8 bigint  ", "1::int8        ", 1_i64
+  test_decode "int8 bigint  ", "-1::int8       ", -1_i64
+  test_decode "bigint       ", "12928394059603 ", 12928394059603_i64
+  test_decode "bigint       ", "-12928394059603", -12928394059603_i64
+  test_decode "float        ", "0.123::float   ", 0.123
+  test_decode "float        ", "-0.123::float  ", -0.123
+  test_decode "regtype      ", "pg_typeof(3)   ", 23
+
+  test_decode "uint64       ", "'FFFFFFFF/FFFFFFFF'::pg_lsn", 18446744073709551615_u64
+
+  test_decode "double prec.", "'35.03554004971999'::float8", 35.03554004971999
+  test_decode "flot prec.", "'0.10000122'::float4", 0.10000122_f32
+
+  test_decode "bytea", "E'\\\\001\\\\134\\\\176'::bytea", bytes([0o001_u8, 0o134_u8, 0o176_u8])
+  test_decode "bytea", "E'\\\\005\\\\000\\\\377\\\\200'::bytea", bytes([5_u8, 0_u8, 255_u8, 128_u8])
+  test_decode "bytea empty", "E''::bytea", bytes([] of UInt8)
+
+  # a plain `read` answers a `UUIDValue`: `UUID` is not a `DBValue`
+  test_decode "uuid", "'7d61d548124c4b38bc05cfbb88cfd1d1'::uuid", uuid("7d61d548-124c-4b38-bc05-cfbb88cfd1d1")
+  test_decode "uuid", "'7d61d548-124c-4b38-bc05-cfbb88cfd1d1'::uuid", uuid("7d61d548-124c-4b38-bc05-cfbb88cfd1d1")
+
+  # a `JSONValue`, equal to another when their parsed documents are
+  if db_version_gte(9, 2)
+    test_decode "json", %('[1,"a",true]'::json), JSONValue.new(%([1,"a",true]))
+    test_decode "json", %('{"a":1}'::json), JSONValue.new(%({"a":1}))
+  end
+  if db_version_gte(9, 4)
+    test_decode "jsonb", "'[1,2,3]'::jsonb", JSONValue.new("[1,2,3]")
+  end
+
+  test_decode "timestamptz", "'2015-02-03 16:15:13-01'::timestamptz",
+    Time.utc(2015, 2, 3, 17, 15, 13)
+
+  test_decode "timestamptz", "'2015-02-03 16:15:14.23-01'::timestamptz",
+    Time.utc(2015, 2, 3, 17, 15, 14, nanosecond: 230_000_000)
+
+  # iyi's `Time` is UTC only: the New York wall time is read as the same
+  # instant in UTC, on a connection whose session time zone is New York's.
+  it "timestamptz" do
+    with_connection do |conn|
+      conn.exec("SET TIME ZONE 'America/New_York'").or_panic
+      value = conn.query_one("select '2015-02-03 16:15:14.23 America/New_York'::timestamptz") { |rs| rs.read }.or_panic
+      assert same?(value, Time.utc(2015, 2, 3, 21, 15, 14, nanosecond: 230_000_000)), value.inspect
+    end
+  end
+
+  test_decode "timestamp", "'2015-02-03 16:15:15'::timestamp",
+    Time.utc(2015, 2, 3, 16, 15, 15)
+
+  test_decode "date", "'2015-02-03'::date",
+    Time.utc(2015, 2, 3, 0, 0, 0)
+
+  # -14706000000 = microseconds in -4 hours, -5 minutes -6 seconds
+  test_decode "interval", "'P-1Y-2M3DT-4H-5M-6S'::interval", Interval.new(-14706000000_i64, 3, -14)
+  test_decode "interval", "'178000000 years'::interval", Interval.new(0_i64, 0, 2_136_000_000)
+  test_decode "interval", "'178000000 years 1 months 5 days 999999 microseconds'::interval", Interval.new(999_999_i64, 5, 2_136_000_001)
+
+  it "numeric" do
+    x = ->(q : String) { PG_DB.query_one("select '#{q}'::numeric", as: Numeric).or_panic }
+    assert x.call("1.3").to_f == 1.3
+    assert x.call("nan").nan?
+  end
+
+  it "decodes many uuids (#148)" do
+    id = UUID.parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    ids = PG_DB.query_all("select '#{id}'::uuid from generate_series(1,1000)", as: UUID).or_panic
+    assert ids.size == 1000
+    assert ids.uniq == [id]
+  end
+
+  test_decode "xml", "'<json>false</json>'::xml", "<json>false</json>"
+  test_decode "char", %('c'::"char"), 'c'
+  test_decode "bpchar", %('c'::char), "c"
+  test_decode "bpchar", %('c'::char(5)), "c    "
+  test_decode "name", %('hi'::name), "hi"
+  test_decode "oid", %(2147483648::oid), 2147483648_u32
+  test_decode "point", "'(1.2,3.4)'::point", Point.new(1.2, 3.4)
+  if db_version_gte(9, 4)
+    test_decode "line ", "'(1,2,3,4)'::line ", Line.new(1.0, -1.0, 1.0)
+    test_decode "line ", "'1,2,3'::circle   ", Circle.new(1.0, 2.0, 3.0)
+  end
+  test_decode "lseg ", "'(1,2,3,4)'::lseg ", LineSegment.new(1.0, 2.0, 3.0, 4.0)
+  test_decode "box  ", "'(1,2,3,4)'::box  ", Box.new(1.0, 2.0, 3.0, 4.0)
+  test_decode "path ", "'(1,2,3,4)'::path ", Path.new([Point.new(1.0, 2.0), Point.new(3.0, 4.0)], closed: true)
+  test_decode "path ", "'[1,2,3,4,5,6]'::path", Path.new([Point.new(1.0, 2.0), Point.new(3.0, 4.0), Point.new(5.0, 6.0)], closed: false)
+  test_decode "polygon", "'1,2,3,4,5,6'::polygon", Polygon.new([Point.new(1.0, 2.0), Point.new(3.0, 4.0), Point.new(5.0, 6.0)])
+end
