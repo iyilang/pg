@@ -1,0 +1,819 @@
+# Reading the binary format of each column type, by the type's OID.
+#
+# `Decoders.from_oid(oid)` is the decoder for a column; an OID nobody
+# registered reads as `Bytes`. `Decoders.register_decoder` adds or replaces
+# one.
+module pg/decoder
+
+import std/int
+import std/float
+import std/text
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import std/uuid::{UUID}
+import std/json::{JSON, Any}
+import db/db/errors::{DBError}
+import db/db/value::{DBValue, CustomValue}
+import pg/pq/stream::{ByteSource}
+import pg/errors::{RuntimeError}
+import pg/numeric::{Numeric}
+import pg/interval::{Interval}
+import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
+
+# A `uuid` column. `DBValue` is a closed set and `std/uuid`'s `UUID` is not
+# in it, so the value a plain `read` answers wraps one; `read(UUID)` answers
+# the `UUID` itself.
+pub class UUIDValue < CustomValue
+  getter uuid : UUID
+
+  def initialize(@uuid : UUID)
+  end
+
+  def ==(other : UUIDValue) : Bool
+    uuid == other.uuid
+  end
+
+  def to_s : String
+    uuid.to_s
+  end
+end
+
+# A `json` or `jsonb` column, as its text. crystal-pg answered a
+# `JSON::PullParser`; `read(JSON::Any)` answers the parsed document.
+pub class JSONValue < CustomValue
+  getter text : String
+
+  def initialize(@text : String)
+  end
+
+  # The document, parsed.
+  def parse : Any
+    JSON.parse(@text)
+  end
+
+  def ==(other : JSONValue) : Bool
+    parse == other.parse
+  end
+
+  def to_s : String
+    @text
+  end
+end
+
+# Reads one value of the types its `oids` name. A decoder reads exactly
+# *bytesize* bytes of *io*.
+pub abstract class Decoder
+  abstract def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+
+  abstract def oids : Array(Int32)
+
+  # The name of the type it answers, for messages.
+  abstract def type_name : String
+end
+
+pub class StringDecoder < Decoder
+  OIDS = [
+    19,   # name (internal type)
+    25,   # text
+    142,  # xml
+    705,  # unknown
+    1042, # blchar
+    1043, # varchar
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_string(bytesize)
+  end
+
+  def type_name : String
+    "String"
+  end
+end
+
+pub class UUIDDecoder < Decoder
+  OIDS = [
+    2950, # UUID
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    UUIDValue.new(UUID.new(io.read_bytes(16)!.to_a))
+  end
+
+  def type_name : String
+    "UUID"
+  end
+end
+
+pub class CharDecoder < Decoder
+  OIDS = [
+    18, # "char" (internal type)
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    chars = io.read_string(bytesize)!.chars
+    chars.empty? ? '\0' : chars[0]
+  end
+
+  def type_name : String
+    "Char"
+  end
+end
+
+pub class BoolDecoder < Decoder
+  OIDS = [
+    16, # bool
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    byte = io.read_byte!
+    case byte
+    when 0_u8 then false
+    when 1_u8 then true
+    else
+      RuntimeError.new("bad boolean decode: #{byte}")
+    end
+  end
+
+  def type_name : String
+    "Bool"
+  end
+end
+
+pub class Int16Decoder < Decoder
+  OIDS = [
+    21, # int2 (smallint)
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_i16
+  end
+
+  def type_name : String
+    "Int16"
+  end
+end
+
+pub class Int32Decoder < Decoder
+  OIDS = [
+    23,   # int4 (integer)
+    2206, # regtype
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_i32
+  end
+
+  def type_name : String
+    "Int32"
+  end
+end
+
+pub class Int64Decoder < Decoder
+  OIDS = [
+    20, # int8 (bigint)
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_i64
+  end
+
+  def type_name : String
+    "Int64"
+  end
+end
+
+pub class UIntDecoder < Decoder
+  OIDS = [
+    26, # oid (internal type)
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_u32
+  end
+
+  def type_name : String
+    "UInt32"
+  end
+end
+
+pub class UInt64Decoder < Decoder
+  OIDS = [
+    3220, # lsn
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_u64
+  end
+
+  def type_name : String
+    "UInt64"
+  end
+end
+
+pub class Float32Decoder < Decoder
+  OIDS = [
+    700, # float4
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_f32
+  end
+
+  def type_name : String
+    "Float32"
+  end
+end
+
+pub class Float64Decoder < Decoder
+  OIDS = [
+    701, # float8
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_f64
+  end
+
+  def type_name : String
+    "Float64"
+  end
+end
+
+pub class PointDecoder < Decoder
+  OIDS = [
+    600, # point
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    read_point(io)
+  end
+
+  def read_point(io : ByteSource) : Point | DBError
+    x = io.read_f64!
+    y = io.read_f64!
+    Point.new(x, y)
+  end
+
+  def type_name : String
+    "PG::Geo::Point"
+  end
+end
+
+pub class PolygonDecoder < Decoder
+  OIDS = [
+    604, # polygon
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    Polygon.new(read_points(io)!)
+  end
+
+  def read_points(io : ByteSource) : Array(Point) | DBError
+    count = io.read_i32!
+    points = [] of Point
+    decoder = PointDecoder.new
+    count.times do
+      point = decoder.read_point(io)
+      return point if point.is_a?(DBError)
+      points << point
+    end
+    points
+  end
+
+  def type_name : String
+    "PG::Geo::Polygon"
+  end
+end
+
+pub class PathDecoder < Decoder
+  OIDS = [
+    602, # path
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    closed = io.read_byte! == 1_u8
+    Path.new(PolygonDecoder.new.read_points(io)!, closed)
+  end
+
+  def type_name : String
+    "PG::Geo::Path"
+  end
+end
+
+pub class BoxDecoder < Decoder
+  OIDS = [
+    603, # box
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    x2 = io.read_f64!
+    y2 = io.read_f64!
+    x1 = io.read_f64!
+    y1 = io.read_f64!
+    Box.new(x1, y1, x2, y2)
+  end
+
+  def type_name : String
+    "PG::Geo::Box"
+  end
+end
+
+pub class LineSegmentDecoder < Decoder
+  OIDS = [
+    601, # lseg
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    x1 = io.read_f64!
+    y1 = io.read_f64!
+    x2 = io.read_f64!
+    y2 = io.read_f64!
+    LineSegment.new(x1, y1, x2, y2)
+  end
+
+  def type_name : String
+    "PG::Geo::LineSegment"
+  end
+end
+
+pub class LineDecoder < Decoder
+  OIDS = [
+    628, # line
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    a = io.read_f64!
+    b = io.read_f64!
+    c = io.read_f64!
+    Line.new(a, b, c)
+  end
+
+  def type_name : String
+    "PG::Geo::Line"
+  end
+end
+
+pub class CircleDecoder < Decoder
+  OIDS = [
+    718, # circle
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    x = io.read_f64!
+    y = io.read_f64!
+    radius = io.read_f64!
+    Circle.new(x, y, radius)
+  end
+
+  def type_name : String
+    "PG::Geo::Circle"
+  end
+end
+
+pub class JsonDecoder < Decoder
+  JSONB_OID = 3802
+
+  OIDS = [
+    114,       # json
+    JSONB_OID, # jsonb
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    size = bytesize
+    if oid == JSONB_OID
+      io.read_byte! # the jsonb format version
+      size -= 1
+    end
+    JSONValue.new(io.read_string(size)!)
+  end
+
+  def type_name : String
+    "JSON"
+  end
+end
+
+pub class TimeDecoder < Decoder
+  DATE        = 1082
+  TIMESTAMP   = 1114
+  TIMESTAMPTZ = 1184
+
+  OIDS = [DATE, TIMESTAMP, TIMESTAMPTZ]
+
+  JAN_1_2K = Time.utc(2000, 1, 1)
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  # A `timestamptz` is answered in UTC: iyi's `Time` has no zones.
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    if oid == DATE
+      JAN_1_2K + Span.days(io.read_i32!.to_i64)
+    else
+      micros = io.read_i64!
+      JAN_1_2K + Span.new(seconds: micros // 1_000_000, nanoseconds: (micros % 1_000_000) * 1_000)
+    end
+  end
+
+  def type_name : String
+    "Time"
+  end
+end
+
+pub class IntervalDecoder < Decoder
+  OIDS = [
+    1186,
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  #
+  # An Interval consists of
+  # * time   (8 bytes)
+  # * days   (4 bytes)
+  # * months (4 bytes)
+  #
+  # See: https://github.com/postgres/postgres/blob/a094c8ff53523e88ff9dd28ad467618039e27b58/src/backend/utils/adt/timestamp.c#L1003
+  #
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    microseconds = io.read_i64!
+    days = io.read_i32!
+    months = io.read_i32!
+    Interval.new(microseconds, days, months)
+  end
+
+  def type_name : String
+    "PG::Interval"
+  end
+end
+
+pub class ByteaDecoder < Decoder
+  OIDS = [
+    17, # bytea
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    io.read_bytes(bytesize)
+  end
+
+  def type_name : String
+    "Bytes"
+  end
+end
+
+pub class NumericDecoder < Decoder
+  OIDS = [
+    1700, # numeric
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    ndigits = io.read_i16!
+    weight = io.read_i16!
+    sign = io.read_i16!
+    dscale = io.read_i16!
+    digits = [] of Int16
+    ndigits.to_i32.times do
+      digit = io.read_i16
+      return digit if digit.is_a?(DBError)
+      digits << digit
+    end
+    Numeric.new(ndigits, weight, sign, dscale, digits)
+  end
+
+  def type_name : String
+    "PG::Numeric"
+  end
+end
+
+# The array header: its dimensions, its element OID, and each dimension's
+# size and lower bound.
+pub struct ArrayHeader
+  getter dimensions : Int32
+  getter oid : Int32
+  getter dim_info : Array(Tuple(Int32, Int32))
+
+  def initialize(@dimensions : Int32, @oid : Int32, @dim_info : Array(Tuple(Int32, Int32)))
+  end
+end
+
+# An array of the elements *element* decodes, as nested `Array(DBValue)`s
+# with `nil` for NULL. An array whose lower bound is above 1 is padded with
+# `nil`s in front, as crystal-pg reads it.
+pub class ArrayDecoder < Decoder
+  getter oids : Array(Int32)
+  getter element : Decoder
+
+  def initialize(@oids : Array(Int32), @element : Decoder)
+  end
+
+  def type_name : String
+    "Array(#{@element.type_name})"
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    header = Decoders.decode_array_header(io)!
+
+    if header.dimensions == 0
+      [] of DBValue
+    elsif header.dimensions == 1 && header.dim_info.first[1] == 1
+      build_simple_array(io, header.dim_info.first[0], header.oid)
+    else
+      if header.dim_info.any? { |di| di[1] < 1 }
+        return RuntimeError.new("Only lower-bounds >= 1 are supported")
+      end
+
+      # recursively build nested array
+      get_element(io, header.dim_info, header.oid)
+    end
+  end
+
+  private def build_simple_array(io : ByteSource, size : Int32, oid : Int32) : DBValue | DBError
+    values = [] of DBValue
+    size.times do
+      value = get_next(io, oid)
+      return value if value.is_a?(DBError)
+      values << value
+    end
+    values
+  end
+
+  private def get_element(io : ByteSource, dim_info : Array(Tuple(Int32, Int32)), oid : Int32) : DBValue | DBError
+    values = [] of DBValue
+    if dim_info.size == 1
+      lbound = dim_info.first[1] - 1 # the lower bound may not be 1
+      (dim_info.first[0] + lbound).times do |i|
+        if i < lbound
+          values << nil
+        else
+          value = get_next(io, oid)
+          return value if value.is_a?(DBError)
+          values << value
+        end
+      end
+    else
+      rest = Decoders.rest_of(dim_info)
+      dim_info.first[0].times do
+        value = get_element(io, rest, oid)
+        return value if value.is_a?(DBError)
+        values << value
+      end
+    end
+    values
+  end
+
+  private def get_next(io : ByteSource, oid : Int32) : DBValue | DBError
+    bytesize = io.read_i32!
+    return nil if bytesize == -1
+    @element.decode(io, bytesize, oid)
+  end
+end
+
+DECODERS        = {} of Int32 => Decoder
+DEFAULT_DECODER = ByteaDecoder.new
+
+# The decoder registry, and array reading by element type.
+pub struct Decoders
+  # The decoder for *oid*; `Bytes` for an OID nobody registered.
+  def self.from_oid(oid : Int32) : Decoder
+    DECODERS[oid]? || DEFAULT_DECODER
+  end
+
+  # Registers *decoder* for each of its OIDs.
+  def self.register_decoder(decoder : Decoder) : Nil
+    decoder.oids.each do |oid|
+      DECODERS[oid] = decoder
+    end
+  end
+
+  def self.decode_array_header(io : ByteSource) : ArrayHeader | DBError
+    dimensions = io.read_i32!
+    io.read_i32! # has_null, unused
+    oid = io.read_i32!
+    dim_info = [] of Tuple(Int32, Int32)
+    dimensions.times do
+      dim = io.read_i32!
+      lbound = io.read_i32!
+      dim_info << {dim, lbound}
+    end
+    ArrayHeader.new(dimensions, oid, dim_info)
+  end
+
+  # *dims* without its first element.
+  def self.rest_of(dims : Array(Tuple(Int32, Int32))) : Array(Tuple(Int32, Int32))
+    rest = [] of Tuple(Int32, Int32)
+    dims.each_with_index { |d, i| rest << d if i > 0 }
+    rest
+  end
+
+  # An array column read as exactly `Array(T)`: `Array(Int32)`,
+  # `Array(Int32?)`, `Array(Array(String))`, ... The element type has to be
+  # the column's, and a NULL element is refused unless `T` is nilable.
+  def self.decode_array(io : ByteSource, bytesize : Int32, t : Array(T).class) : Array(T) | DBError forall T
+    header = decode_array_header(io)
+    return header if header.is_a?(DBError)
+
+    decoder = array_decoder(T)
+    unless decoder.oids.includes?(header.oid)
+      correct_decoder = from_oid(header.oid)
+      return RuntimeError.new("Can't read column of type Array(#{correct_decoder.type_name}) as Array(#{decoder.type_name})")
+    end
+
+    return [] of T if header.dimensions == 0
+
+    decode_array_element(io, t, header.dim_info, decoder, header.oid)
+  end
+
+  def self.decode_array_element(io : ByteSource, t : Array(T).class, dim_info : Array(Tuple(Int32, Int32)), decoder : Decoder, oid : Int32) : Array(T) | DBError forall T
+    size = dim_info.first[0]
+    rest = rest_of(dim_info)
+    values = [] of T
+    size.times do
+      value = decode_array_element(io, T, rest, decoder, oid)
+      return value if value.is_a?(DBError)
+      values << value
+    end
+    values
+  end
+
+  def self.decode_array_element(io : ByteSource, t : T.class, dim_info : Array(Tuple(Int32, Int32)), decoder : Decoder, oid : Int32) : T | DBError forall T
+    bytesize = io.read_i32
+    return bytesize if bytesize.is_a?(DBError)
+    return null_element(T) if bytesize == -1
+    value = decoder.decode(io, bytesize, oid)
+    return value if value.is_a?(DBError)
+    element_as(value, T)
+  end
+
+  # A NULL element: nil for a nilable element type, an error otherwise.
+  def self.null_element(t : T.class) : T | DBError forall T
+    {% if T.nilable? %}
+      nil
+    {% else %}
+      RuntimeError.new("unexpected NULL")
+    {% end %}
+  end
+
+  def self.element_as(value : DBValue, t : UUID.class) : UUID | DBError
+    return value.uuid if value.is_a?(UUIDValue)
+    RuntimeError.new("expected a UUID, got #{value.class}")
+  end
+
+  def self.element_as(value : DBValue, t : (UUID | Nil).class) : UUID | Nil | DBError
+    return nil if value.nil?
+    element_as(value, UUID)
+  end
+
+  # *value* as the element type: the decoder was chosen by it, so this is a
+  # cast. `is_a?` does not narrow to a union such as `Int32?`, so a nilable
+  # type answers its nil and casts the rest to the type without `Nil`, as
+  # iyi-db's `ResultSet#read` does.
+  def self.element_as(value : DBValue, t : T.class) : T | DBError forall T
+    if value.is_a?(T)
+      {% if T.nilable? %}
+        return nil if value.nil?
+        value.as(typeof(value.as(T) || raise("")))
+      {% else %}
+        value.as(T)
+      {% end %}
+    else
+      RuntimeError.new("expected #{T}, got #{value.class}")
+    end
+  end
+
+  {% for type in %w(Bool Char Int16 Int32 String Int64 Float32 Float64 Numeric Time UUID) %}
+    def self.array_decoder(t : ({{ type.id }} | Nil).class) : Decoder
+      {{ type.id }}Decoder.new
+    end
+
+    def self.array_decoder(t : {{ type.id }}.class) : Decoder
+      {{ type.id }}Decoder.new
+    end
+  {% end %}
+
+  def self.array_decoder(t : Array(T).class) : Decoder forall T
+    array_decoder(T)
+  end
+end
+
+# https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.h
+Decoders.register_decoder BoolDecoder.new
+Decoders.register_decoder ByteaDecoder.new
+Decoders.register_decoder CharDecoder.new
+Decoders.register_decoder StringDecoder.new
+Decoders.register_decoder UUIDDecoder.new
+Decoders.register_decoder Int16Decoder.new
+Decoders.register_decoder Int32Decoder.new
+Decoders.register_decoder Int64Decoder.new
+Decoders.register_decoder UIntDecoder.new
+Decoders.register_decoder UInt64Decoder.new
+Decoders.register_decoder JsonDecoder.new
+Decoders.register_decoder Float32Decoder.new
+Decoders.register_decoder Float64Decoder.new
+Decoders.register_decoder TimeDecoder.new
+Decoders.register_decoder IntervalDecoder.new
+Decoders.register_decoder NumericDecoder.new
+Decoders.register_decoder PointDecoder.new
+Decoders.register_decoder LineSegmentDecoder.new
+Decoders.register_decoder PathDecoder.new
+Decoders.register_decoder BoxDecoder.new
+Decoders.register_decoder PolygonDecoder.new
+Decoders.register_decoder LineDecoder.new
+Decoders.register_decoder CircleDecoder.new
+
+# Arrays of the element types above. crystal-pg's `array_type` macro.
+Decoders.register_decoder ArrayDecoder.new([1000], BoolDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1002], CharDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1005], Int16Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([1007], Int32Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([1016], Int64Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([1021], Float32Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([1022], Float64Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([1009], StringDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1231], NumericDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1115, 1182], TimeDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([2951], UUIDDecoder.new)
