@@ -1,0 +1,63 @@
+# The ways the wire protocol fails, as values (SPEC.md III.1).
+#
+# crystal-pg raises `PQ::ConnectionError`, `PQ::PQError` and `IO::Error`.
+# Here they are `DBError`s, so a `!` hands them through iyi-db unchanged and
+# `in DBError` still catches every one of them.
+module pg/pq/errors
+
+import db/db/errors::{DBError}
+
+# One field of an `ErrorResponse` or a `NoticeResponse`: its name
+# (`:severity`, `:code`, `:message`, ...), its text, and the protocol's code
+# byte for it.
+#
+# https://www.postgresql.org/docs/current/protocol-error-fields.html
+pub struct ErrorField
+  getter name : Symbol
+  getter message : String
+  getter code : UInt8
+
+  def initialize(@name : Symbol, @message : String, @code : UInt8)
+  end
+
+  def inspect : String
+    "#{name}: #{message}"
+  end
+
+  def to_s : String
+    inspect
+  end
+end
+
+# A connection could not be established or set up: refused, an
+# authentication the configuration does not allow, a parameter the driver
+# does not support.
+pub class ConnectionError < DBError
+end
+
+# The socket failed or ended in the middle of a message. crystal-pg's
+# `IO::Error`; a statement answers it as iyi-db's `ConnectionLost`, so the
+# pool retries on another connection.
+pub class StreamError < ConnectionError
+end
+
+# The server answered an `ErrorResponse`. Its *fields* say what went wrong;
+# the message is the `:message` field.
+pub class PQError < DBError
+  getter fields : Array(ErrorField)
+
+  def initialize(@fields : Array(ErrorField))
+    super(PQError.field_message(@fields, :message) || "")
+  end
+
+  # The text of the field named *name*, or nil when the server sent none.
+  def field_message(name : Symbol) : String?
+    PQError.field_message(@fields, name)
+  end
+
+  def self.field_message(fields : Array(ErrorField), name : Symbol) : String?
+    if field = fields.find { |f| f.name == name }
+      field.message
+    end
+  end
+end

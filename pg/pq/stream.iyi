@@ -1,0 +1,331 @@
+# Big-endian byte sources: the buffered socket stream the protocol reads and
+# writes, and bytes in memory that a decoder reads the same way.
+# crystal-pg wrote straight to its `TCPSocket` with `sync = false` and
+# decoded from `IO`s; iyi's socket has no buffer of its own, so this is it.
+#
+# Every read answers `StreamError` when the bytes asked for are not there:
+# the socket failed, or the source ended first.
+module pg/pq/stream
+
+import std/int
+import std/float
+import std/socket::{IyiSocket, SocketError}
+import std/slice::{Slice, Bytes}
+import pg/pq/errors::{StreamError}
+
+# What a decoder reads from: a socket stream or bytes in memory.
+pub abstract class ByteSource
+  abstract def read_byte : UInt8 | StreamError
+
+  # Fills *count* bytes at *target*.
+  abstract def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
+
+  abstract def skip(count : Int64) : Nil | StreamError
+
+  def skip(count : Int32) : Nil | StreamError
+    skip(count.to_i64)
+  end
+
+  # Fills *slice* whole.
+  def read_fully(slice : Bytes) : Nil | StreamError
+    read_fully(slice.to_unsafe, slice.size)
+  end
+
+  def read_char : Char | StreamError
+    read_byte!.unsafe_chr
+  end
+
+  def read_i16 : Int16 | StreamError
+    b0 = read_byte!.to_i32
+    b1 = read_byte!.to_i32
+    v = (b0 << 8) | b1
+    (v >= 32768 ? v - 65536 : v).to_i16
+  end
+
+  def read_i32 : Int32 | StreamError
+    b0 = read_byte!.to_i32
+    b1 = read_byte!.to_i32
+    b2 = read_byte!.to_i32
+    b3 = read_byte!.to_i32
+    (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+  end
+
+  def read_u32 : UInt32 | StreamError
+    read_i32!.unsafe_to_u32
+  end
+
+  def read_i64 : Int64 | StreamError
+    hi = read_i32!.to_i64 & 0xFFFFFFFF_i64
+    lo = read_i32!.to_i64 & 0xFFFFFFFF_i64
+    (hi << 32) | lo
+  end
+
+  def read_u64 : UInt64 | StreamError
+    read_i64!.unsafe_to_u64
+  end
+
+  def read_f32 : Float32 | StreamError
+    bits = read_u32!
+    pointerof(bits).as(Float32*).value
+  end
+
+  def read_f64 : Float64 | StreamError
+    bits = read_u64!
+    pointerof(bits).as(Float64*).value
+  end
+
+  # *count* bytes, newly allocated.
+  def read_bytes(count : Int32) : Bytes | StreamError
+    slice = Bytes.new(count)
+    read_fully(slice)!
+    slice
+  end
+
+  # *count* bytes as a string.
+  def read_string(count : Int32) : String | StreamError
+    failed = nil.as(StreamError?)
+    text = String.new(count) do |buffer|
+      result = read_fully(buffer, count)
+      failed = result if result.is_a?(StreamError)
+    end
+    if f = failed
+      return f
+    end
+    text
+  end
+end
+
+# Bytes in memory, read from the start.
+pub class MemorySource < ByteSource
+  getter bytes : Bytes
+  getter pos : Int32 = 0
+
+  def initialize(@bytes : Bytes)
+  end
+
+  def remaining : Int32
+    @bytes.size - @pos
+  end
+
+  def read_byte : UInt8 | StreamError
+    return StreamError.new("Unexpected end of data") if @pos >= @bytes.size
+    byte = @bytes[@pos]
+    @pos += 1
+    byte
+  end
+
+  def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
+    return StreamError.new("Unexpected end of data") if count > remaining
+    target.copy_from(@bytes.to_unsafe + @pos, count)
+    @pos += count
+    nil
+  end
+
+  def skip(count : Int64) : Nil | StreamError
+    return StreamError.new("Unexpected end of data") if count > remaining
+    @pos += count.to_i32
+    nil
+  end
+end
+
+# A buffered stream over a socket. Writes collect in memory until `flush`.
+pub class Stream < ByteSource
+  BUFFER_SIZE = 16384
+
+  @socket : IyiSocket
+  @rbuf : Bytes
+  @rpos = 0
+  @rlen = 0
+  # bytes of the stream before the buffer's first one
+  @base = 0_i64
+  @wbuf : Bytes
+  @wlen = 0
+
+  def initialize(@socket : IyiSocket)
+    @rbuf = Bytes.new(BUFFER_SIZE)
+    @wbuf = Bytes.new(BUFFER_SIZE)
+  end
+
+  def socket : IyiSocket
+    @socket
+  end
+
+  def closed? : Bool
+    @socket.closed?
+  end
+
+  def close : Nil
+    @socket.close
+  end
+
+  # How many bytes have been read from the stream so far.
+  def position : Int64
+    @base + @rpos
+  end
+
+  # ------------------------------------------------------------- reading
+
+  # Reads at least one byte into the buffer; nothing when it holds some.
+  private def fill : Nil | StreamError
+    return nil if @rpos < @rlen
+    return StreamError.new("Socket is closed") if @socket.closed?
+    n = @socket.read(@rbuf.to_unsafe, @rbuf.size)
+    case n
+    when Int32
+      return StreamError.new("Unexpected end of stream from server") if n == 0
+      @base += @rlen
+      @rpos = 0
+      @rlen = n
+      nil
+    when SocketError
+      StreamError.new("Socket error: #{n.reason}")
+    else
+      StreamError.new("Socket read was cancelled")
+    end
+  end
+
+  def read_byte : UInt8 | StreamError
+    fill!
+    byte = @rbuf[@rpos]
+    @rpos += 1
+    byte
+  end
+
+  def read_i32 : Int32 | StreamError
+    if @rlen - @rpos >= 4
+      p = @rbuf.to_unsafe + @rpos
+      @rpos += 4
+      return (p[0].to_i32 << 24) | (p[1].to_i32 << 16) | (p[2].to_i32 << 8) | p[3].to_i32
+    end
+    super
+  end
+
+  def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
+    done = 0
+    while done < count
+      if @rpos == @rlen && count - done >= @rbuf.size
+        # a big read goes straight to its target
+        return StreamError.new("Socket is closed") if @socket.closed?
+        n = @socket.read(target + done, count - done)
+        case n
+        when Int32
+          return StreamError.new("Unexpected end of stream from server") if n == 0
+          done += n
+          @base += n
+        when SocketError
+          return StreamError.new("Socket error: #{n.reason}")
+        else
+          return StreamError.new("Socket read was cancelled")
+        end
+        next
+      end
+      fill!
+      take = @rlen - @rpos
+      take = count - done if take > count - done
+      (target + done).copy_from(@rbuf.to_unsafe + @rpos, take)
+      @rpos += take
+      done += take
+    end
+    nil
+  end
+
+  # At most *count* bytes into *target*, at least one: what a reader of a
+  # stream of unknown length asks for.
+  def read_some(target : Pointer(UInt8), count : Int32) : Int32 | StreamError
+    return 0 if count == 0
+    fill!
+    take = @rlen - @rpos
+    take = count if take > count
+    target.copy_from(@rbuf.to_unsafe + @rpos, take)
+    @rpos += take
+    take
+  end
+
+  def skip(count : Int64) : Nil | StreamError
+    left = count
+    while left > 0
+      fill!
+      take = (@rlen - @rpos).to_i64
+      take = left if take > left
+      @rpos += take.to_i32
+      left -= take
+    end
+    nil
+  end
+
+  # ------------------------------------------------------------- writing
+
+  private def reserve(count : Int32) : Nil
+    return if @wlen + count <= @wbuf.size
+    size = @wbuf.size * 2
+    while size < @wlen + count
+      size *= 2
+    end
+    bigger = Bytes.new(size)
+    bigger.to_unsafe.copy_from(@wbuf.to_unsafe, @wlen)
+    @wbuf = bigger
+  end
+
+  def write_byte(byte : UInt8) : Nil
+    reserve(1)
+    @wbuf[@wlen] = byte
+    @wlen += 1
+  end
+
+  def write_char(char : Char) : Nil
+    write_byte(char.ord.to_u8)
+  end
+
+  def write_i32(value : Int32) : Nil
+    reserve(4)
+    p = @wbuf.to_unsafe + @wlen
+    p[0] = ((value >> 24) & 0xFF).to_u8
+    p[1] = ((value >> 16) & 0xFF).to_u8
+    p[2] = ((value >> 8) & 0xFF).to_u8
+    p[3] = (value & 0xFF).to_u8
+    @wlen += 4
+  end
+
+  def write_i16(value : Int32) : Nil
+    reserve(2)
+    p = @wbuf.to_unsafe + @wlen
+    p[0] = ((value >> 8) & 0xFF).to_u8
+    p[1] = (value & 0xFF).to_u8
+    @wlen += 2
+  end
+
+  def write_i64(value : Int64) : Nil
+    write_i32((value >> 32).unsafe_to_i32)
+    write_i32(value.unsafe_to_i32)
+  end
+
+  def write(source : Pointer(UInt8), count : Int32) : Nil
+    reserve(count)
+    (@wbuf.to_unsafe + @wlen).copy_from(source, count)
+    @wlen += count
+  end
+
+  def write(slice : Bytes) : Nil
+    write(slice.to_unsafe, slice.size)
+  end
+
+  def write(text : String) : Nil
+    write(text.to_unsafe, text.bytesize)
+  end
+
+  # Sends what was written.
+  def flush : Nil | StreamError
+    return nil if @wlen == 0
+    return StreamError.new("Socket is closed") if @socket.closed?
+    n = @socket.write(@wbuf.to_unsafe, @wlen)
+    @wlen = 0
+    case n
+    when Int32
+      nil
+    when SocketError
+      StreamError.new("Socket error: #{n.reason}")
+    else
+      StreamError.new("Socket write was cancelled")
+    end
+  end
+end
