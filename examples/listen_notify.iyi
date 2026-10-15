@@ -1,0 +1,46 @@
+# LISTEN/NOTIFY: crystal-pg's examples/listen_notify.cr. The connection is
+# DATABASE_URL's, `postgres:///` by default.
+module examples/listen_notify
+
+import std/env
+import std/random::{Random}
+import db/db/db
+import pg/pg
+
+URL = ENV["DATABASE_URL"]? || "postgres:///"
+
+PG_DB = ::Db::Db.open(URL).or_panic # make a normal connection
+
+group do |g|
+  # connect and listen on "a" and "b"; the reading runs as a task of `g`
+  listen_conn = ::Pg::Pg.connect_listen(URL, ["a", "b"], g) do |n|
+    puts "    got: #{n.payload} on #{n.channel}" # print notifications as they come in
+  end.or_panic
+
+  sender = g.spawn do # spawn a task
+    random = Random.new
+    10.times do |i|
+      chan = random.rand > 0.5 ? "a" : "b"                          # pick a channel
+      puts "sending: #{i}"                                          # prints always before "got:"
+      PG_DB.exec("SELECT pg_notify($1, $2)", chan, i.to_s).or_panic # send notification
+      puts "   sent: #{i}"                                          # may print before or after "got:"
+      sleep 250
+    end
+    0
+  end
+
+  sender.value
+  listen_conn.close
+end
+
+# Example output. Ordering and channels will vary.
+#
+# sending: 0
+#    sent: 0
+#     got: 0 on a
+# sending: 1
+#     got: 1 on a
+#    sent: 1
+# sending: 2
+#    sent: 2
+#     got: 2 on a

@@ -1,0 +1,15 @@
+# Runs the query given as the first argument against DATABASE_URL and
+# prints its first column: crystal-pg's examples/command.
+#
+#   iyi run examples/command.iyi -- "select 1"
+module examples/command
+
+import std/env
+import std/kernel::{p, abort}
+import db/db/db
+import pg/core
+
+query = Program.args[0]? || abort("usage: command QUERY")
+::Db::Db.open(ENV["DATABASE_URL"]) do |db|
+  p db.query_one(query) { |rs| rs.read.or_panic }.or_panic
+end.or_panic

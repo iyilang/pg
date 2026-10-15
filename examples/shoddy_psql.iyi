@@ -1,0 +1,101 @@
+# A tiny interactive client: crystal-pg's examples/shoddy_psql.cr. It reads
+# lines from standard input (crystal's version linked readline, which iyi
+# programs do not have on every platform); `\q` quits.
+#
+#   iyi run examples/shoddy_psql.iyi -- postgres://user:pass@127.0.0.1/db
+module examples/shoddy_psql
+
+import std/text
+import db/db/db
+import db/db/core::{ResultSet}
+import db/db/errors::{DBError}
+import db/db/value::{DBValue}
+import pg/core
+import pg/numeric::{Numeric}
+
+def readline : String?
+  print "# "
+  STDOUT.flush
+  line = STDIN.gets
+  line ? line.chomp : nil
+end
+
+# The rows of *rs*, the column names first.
+def gather(rs : ResultSet) : Array(Array(DBValue)) | DBError
+  rows = [] of Array(DBValue)
+  names = [] of DBValue
+  rs.column_count.times { |i| names << rs.column_name(i) }
+  rows << names
+  rs.each do
+    row = [] of DBValue
+    rs.column_count.times { row << rs.read.or_panic }
+    rows << row
+  end!
+  rows
+end
+
+def show(rows : Array(Array(DBValue))) : Nil
+  # Compute maximum sizes for each column for a nicer output
+  sizes = [] of Int32
+  rows[0].size.times do |i|
+    # Add 2 for padding
+    sizes << rows.max_by { |row| row[i].to_s.size }[i].to_s.size + 2
+  end
+
+  # Print rows
+  rows.each_with_index do |row, row_index|
+    row.each_with_index do |value, col_index|
+      print " |" if col_index > 0
+      print " "
+      col_size = sizes[col_index] - 2
+      case value
+      when Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Numeric
+        print value.to_s.rjust(col_size)
+      else
+        print value.to_s.ljust(col_size)
+      end
+    end
+
+    # Write the separator ("---+---+---") after the first row
+    if row_index == 0
+      puts
+      row.size.times do |col_index|
+        print "+" if col_index > 0
+        print "-" * sizes[col_index]
+      end
+    end
+
+    puts
+  end
+
+  # Print numbers of rows
+  count = rows.size - 1
+  if count == 1
+    puts "(1 row)"
+  else
+    puts "(#{count} rows)"
+  end
+end
+
+url = Program.args[0]? || "postgres:///"
+db = ::Db::Db.open(url).or_panic
+
+loop do
+  query = readline
+  break if query.nil? || query == "\\q"
+  has_results = false
+  result = db.query(query) do |rs|
+    has_results = rs.column_count > 0
+    has_results ? gather(rs) : nil
+  end
+  case result
+  in DBError
+    puts "ERROR: #{result.message}"
+  in Array(Array(DBValue))
+    show(result)
+  in Nil
+    # a command without rows
+  end
+  puts if has_results
+end
+db.close

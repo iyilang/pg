@@ -1,0 +1,70 @@
+# A small example on how to use the underlying driver to execute Simple
+# Query messages: crystal-pg's examples/simple_query.cr.
+# https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY
+#
+# The connection is described by the PG* environment variables.
+module examples/simple_query
+
+import std/text
+import std/kernel::{p}
+import std/slice::{Slice, Bytes}
+import db/db/errors::{DBError}
+import pg/pq/conninfo::{ConnInfo}
+import pg/pq/connection::{PQConnection}
+import pg/pq/frame::*
+
+# crystal-pg subclassed `PQ::Connection`; `PQConnection.open` builds the
+# class itself, so this wraps one.
+class SimpleConnection
+  def initialize(@conn : PQConnection)
+  end
+
+  def self.connect(conninfo : ConnInfo) : SimpleConnection | DBError
+    conn = PQConnection.open(conninfo)!
+    conn.connect!
+    SimpleConnection.new(conn)
+  end
+
+  # Run a single query using the Postgres Simple Query protocol
+  # - Yields each row as an Array(String?)
+  # - Returns the row description
+  #
+  # NOTE: While this protocol supports more than one statement per message,
+  # this very basic client implementaiton does not, and will error out on the
+  # call expecting the ReadyForQuery frame.
+  def sq(query : String, & : Array(String?) -> Nil) : Array(Field) | DBError
+    @conn.send_query_message(query)!
+    frame = @conn.read!
+    fields = case frame
+             when Frame::RowDescription
+               @conn.read_all_data_rows do |row|
+                 yield row.map { |col| col ? text(col) : nil }
+               end!
+               frame.fields
+             when Frame::CommandComplete, Frame::EmptyQueryResponse
+               [] of Field
+             else
+               return DBError.new("expected RowDescription or NoData, got #{frame}")
+             end
+
+    @conn.expect_frame(Frame::ReadyForQuery)!
+    fields
+  end
+
+  # ingore any rows in the results
+  def sq(query : String) : Array(Field) | DBError
+    sq(query) { |row| nil }
+  end
+
+  private def text(bytes : Bytes) : String
+    String.new(bytes.size) { |buffer| buffer.copy_from(bytes.to_unsafe, bytes.size) }
+  end
+end
+
+conn = SimpleConnection.connect(ConnInfo.new).or_panic
+
+fields = conn.sq("select generate_series(1,10), now()") { |row| p row }.or_panic
+p fields.map(&.name)
+
+# Will not work:
+# conn.sq("select 1; select 2") { |r| p r }
