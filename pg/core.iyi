@@ -1,0 +1,519 @@
+# The driver: crystal-pg's `PG::Driver`, `PG::Connection`, `PG::Statement`
+# and `PG::ResultSet`, the classes iyi-db's `Driver`, `Connection`,
+# `Statement` and `ResultSet` are subclassed by. They refer to one another,
+# and an import graph has no cycles (R-1), so they live in one module, as
+# iyi-db's own do.
+#
+# The names carry a `PG` prefix because this module imports iyi-db's
+# `Connection`, `Statement` and `ResultSet` by those names.
+module pg/core
+
+import std/int
+import std/text
+import std/uri::{URI, Params}
+import std/uuid::{UUID}
+import std/json::{JSON, Any}
+import std/big::{BigDecimal, BigRational}
+import std/slice::{Slice, Bytes}
+import db/db/db
+import db/db/errors::*
+import db/db/value::{DBValue, ExecResult}
+import db/db/core::{Driver, ConnectionBuilder, ResultSet, Statement, Connection, ConnectionLost}
+import pg/pq/errors::{StreamError}
+import pg/pq/stream::{ByteSource}
+import pg/pq/frame::*
+import pg/pq/param::{Param}
+import pg/pq/conninfo::{ConnInfo}
+import pg/pq/connection::{PQConnection}
+import pg/errors::{RuntimeError}
+import pg/numeric::{Numeric}
+import pg/decoder::{Decoder, Decoders, UUIDValue, JSONValue}
+# imported for its registration of the `record` decoder
+import pg/record::{Record}
+import pg/escape::{EscapeHelper}
+import pg/copy_result::{CopyResult}
+
+pub class PGResultSet < ResultSet
+  getter rows_affected : Int64
+  @fields : Array(Field)?
+  # The current column, -1 before the first row.
+  @column_index = -1
+  # Whether every row was read.
+  @end = false
+
+  def initialize(statement : Statement, @conn : PQConnection, @fields : Array(Field)?)
+    super(statement)
+    @rows_affected = 0_i64
+  end
+
+  protected def conn : PQConnection
+    @conn
+  end
+
+  # A socket failure answers `ConnectionLost`, which closes the connection
+  # so the pool does not hand it out again.
+  private def lost(error : DBError) : DBError
+    return ConnectionLost.new(statement.connection, error) if error.is_a?(StreamError)
+    error
+  end
+
+  def move_next : Bool | DBError
+    result = advance
+    if result.is_a?(DBError)
+      @end = true
+      return lost(result)
+    end
+    result
+  end
+
+  private def advance : Bool | DBError
+    return false if @end
+
+    fields = @fields
+
+    # `move_next` might be called before consuming all rows,
+    # in that case we need to skip columns
+    if fields && @column_index > -1 && @column_index < fields.size
+      while @column_index < fields.size
+        skip!
+      end
+    end
+
+    unless fields
+      @end = true
+      frame = @conn.read!
+      case frame
+      when Frame::CommandComplete
+        @rows_affected = frame.rows_affected
+      when Frame::EmptyQueryResponse
+        # nothing affected
+      else
+        return DBError.new("Expected CommandComplete or EmptyQueryResponse but got #{frame}")
+      end
+
+      @conn.expect_frame(Frame::ReadyForQuery)!
+      return false
+    end
+
+    if @conn.read_next_row_start!
+      # We ignore these (redundant information)
+      @conn.read_i32! # size
+      @conn.read_i16! # ncols
+      @column_index = 0
+      true
+    else
+      @conn.expect_frame(Frame::ReadyForQuery)!
+      @end = true
+      false
+    end
+  end
+
+  def column_count : Int32
+    fields = @fields
+    fields ? fields.size : 0
+  end
+
+  def column_name(index : Int32) : String
+    field(index).name
+  end
+
+  # The name of the type the column at *index* reads as.
+  def column_type(index : Int32) : String
+    decoder(index).type_name
+  end
+
+  def next_column_index : Int32
+    @column_index
+  end
+
+  def read : DBValue | DBError
+    col_bytesize = @conn.read_i32
+    return lost(col_bytesize) if col_bytesize.is_a?(DBError)
+    if col_bytesize == -1
+      @column_index += 1
+      return nil
+    end
+
+    decoder = decoder(@column_index)
+    oid = oid(@column_index)
+    value = safe_read(col_bytesize) do |io|
+      decoder.decode(io, col_bytesize, oid)
+    end
+    return lost(value) if value.is_a?(DBError)
+    value
+  end
+
+  def read(t : Array(T).class) : Array(T) | DBError forall T
+    value = read_array(Array(T))
+    return RuntimeError.new("unexpected NULL, expecting to read #{t}") if value.nil?
+    value
+  end
+
+  def read(t : (Array(T) | Nil).class) : Array(T) | Nil | DBError forall T
+    read_array(Array(T))
+  end
+
+  def read(t : String.class) : String | DBError
+    index = @column_index
+    value = read!
+    case value
+    when String
+      value
+    when Bytes
+      PGResultSet.bytes_string(value)
+    else
+      mismatch(index, value, "String")
+    end
+  end
+
+  def read(t : (String | Nil).class) : String | Nil | DBError
+    index = @column_index
+    value = read!
+    case value
+    when String, Nil
+      value
+    when Bytes
+      PGResultSet.bytes_string(value)
+    else
+      mismatch(index, value, "(String | Nil)")
+    end
+  end
+
+  def read(t : UUID.class) : UUID | DBError
+    index = @column_index
+    value = read!
+    return value.uuid if value.is_a?(UUIDValue)
+    mismatch(index, value, "UUID")
+  end
+
+  def read(t : (UUID | Nil).class) : UUID | Nil | DBError
+    index = @column_index
+    value = read!
+    return nil if value.nil?
+    return value.uuid if value.is_a?(UUIDValue)
+    mismatch(index, value, "(UUID | Nil)")
+  end
+
+  # A `json` or `jsonb` column, parsed.
+  def read(t : Any.class) : Any | DBError
+    index = @column_index
+    value = read!
+    return value.parse if value.is_a?(JSONValue)
+    mismatch(index, value, "JSON::Any")
+  end
+
+  def read(t : (Any | Nil).class) : Any | Nil | DBError
+    index = @column_index
+    value = read!
+    return nil if value.nil?
+    return value.parse if value.is_a?(JSONValue)
+    mismatch(index, value, "(JSON::Any | Nil)")
+  end
+
+  # A `numeric` column with every digit. crystal-pg's `pg_ext/big_decimal`.
+  def read(t : BigDecimal.class) : BigDecimal | DBError
+    read(Numeric)!.to_big_d
+  end
+
+  def read(t : (BigDecimal | Nil).class) : BigDecimal | Nil | DBError
+    value = read(Numeric | Nil)!
+    value.nil? ? nil : value.to_big_d
+  end
+
+  # A `numeric` column with every digit. crystal-pg's `pg_ext/big_rational`.
+  def read(t : BigRational.class) : BigRational | DBError
+    read(Numeric)!.to_big_r
+  end
+
+  def read(t : (BigRational | Nil).class) : BigRational | Nil | DBError
+    value = read(Numeric | Nil)!
+    value.nil? ? nil : value.to_big_r
+  end
+
+  def read(klass : T.class) : T | DBError forall T
+    super
+  end
+
+  private def read_array(t : Array(T).class) : Array(T) | Nil | DBError forall T
+    col_bytesize = @conn.read_i32
+    return lost(col_bytesize) if col_bytesize.is_a?(DBError)
+    if col_bytesize == -1
+      @column_index += 1
+      return nil
+    end
+
+    value = safe_read(col_bytesize) do |io|
+      Decoders.decode_array(io, col_bytesize, t)
+    end
+    return lost(value) if value.is_a?(DBError)
+    value
+  end
+
+  # Runs the decoding in the block over the next *col_bytesize* bytes, then
+  # skips whatever it left of them - all of them when it failed - and moves
+  # to the next column.
+  private def safe_read(col_bytesize : Int32, & : ByteSource -> U) : U | DBError forall U
+    stream = @conn.stream
+    start = stream.position
+    value = yield stream
+    @column_index += 1
+    left = col_bytesize.to_i64 - (stream.position - start)
+    if left > 0
+      skipped = stream.skip(left)
+      return skipped if skipped.is_a?(DBError)
+    end
+    value
+  end
+
+  private def mismatch(index : Int32, value : DBValue, expected : String) : DBError
+    ColumnTypeMismatchError.new(
+      context: "#{self.class}#read",
+      column_index: index,
+      column_name: column_name(index),
+      column_type: value.class.to_s,
+      expected_type: expected
+    )
+  end
+
+  def self.bytes_string(bytes : Bytes) : String
+    String.new(bytes.size) do |buffer|
+      buffer.copy_from(bytes.to_unsafe, bytes.size)
+    end
+  end
+
+  private def field(index : Int32) : Field
+    fields = @fields
+    raise "no fields in this result" if fields.nil?
+    fields[index]
+  end
+
+  private def decoder(index : Int32) : Decoder
+    Decoders.from_oid(oid(index))
+  end
+
+  private def oid(index : Int32) : Int32
+    field(index).type_oid
+  end
+
+  private def skip : Nil | DBError
+    col_size = @conn.read_i32!
+    @conn.skip_bytes(col_size)! if col_size != -1
+    @column_index += 1
+    nil
+  end
+
+  protected def do_close : Nil | DBError
+    drained = drain
+    # Release the connection only after the remaining rows were skipped,
+    # otherwise another task could check it out and read them. A lost
+    # connection has nothing left to drain.
+    released = super
+    return drained if drained.is_a?(DBError) && !drained.is_a?(ConnectionLost)
+    released
+  end
+
+  private def drain : Nil | DBError
+    # Nothing to do if all the rows were consumed
+    return nil if @end
+
+    # Check if we didn't advance to the first row
+    if @column_index == -1
+      return nil unless move_next!
+    end
+
+    fields = @fields
+
+    while true
+      # Skip remaining columns
+      while fields && @column_index < fields.size
+        skipped = skip
+        return lost(skipped) if skipped.is_a?(DBError)
+      end
+
+      break unless move_next!
+    end
+    nil
+  end
+end
+
+pub class PGStatement < Statement
+  def initialize(connection : Connection, @conn : PQConnection, command : String)
+    super(connection, command)
+  end
+
+  protected def conn : PQConnection
+    @conn
+  end
+
+  # A socket failure answers `ConnectionLost`, which closes the connection
+  # so the pool retries on another one.
+  private def lost(error : DBError) : DBError
+    return ConnectionLost.new(connection, error) if error.is_a?(StreamError)
+    error
+  end
+
+  protected def perform_query(args : Array(DBValue)) : ResultSet | DBError
+    result = start_query(args)
+    return lost(result) if result.is_a?(DBError)
+    result
+  end
+
+  protected def perform_exec(args : Array(DBValue)) : ExecResult | DBError
+    result = start_query(args)
+    return lost(result) if result.is_a?(DBError)
+    result.each { }!
+    ExecResult.new(
+      rows_affected: result.rows_affected,
+      last_insert_id: 0_i64 # postgres doesn't support this
+    )
+  end
+
+  # Parses, binds and executes the statement with the extended query
+  # protocol, and reads up to the description of its rows.
+  private def start_query(args : Array(DBValue)) : PGResultSet | DBError
+    params = args.map { |arg| Param.encode(arg) }
+    @conn.send_parse_message(command)
+    @conn.send_bind_message(params)
+    @conn.send_describe_portal_message
+    @conn.send_execute_message
+    @conn.send_sync_message!
+    @conn.expect_frame(Frame::ParseComplete)!
+    @conn.expect_frame(Frame::BindComplete)!
+    frame = @conn.read!
+    fields = case frame
+             when Frame::RowDescription
+               frame.fields
+             when Frame::NoData
+               nil
+             else
+               return DBError.new("expected RowDescription or NoData, got #{frame}")
+             end
+    PGResultSet.new(self, @conn, fields)
+  end
+end
+
+pub class PGConnection < Connection
+  # The protocol session under this connection.
+  getter connection : PQConnection
+
+  def initialize(options : Connection::Options, @connection : PQConnection)
+    super(options)
+  end
+
+  # Opens the session *conn_info* describes; `ConnectionRefused`, with the
+  # reason as its cause, when it cannot be established.
+  def self.open(options : Connection::Options, conn_info : ConnInfo) : PGConnection | DBError
+    pq = PQConnection.open(conn_info)
+    return ConnectionRefused.new(pq.message, pq) if pq.is_a?(DBError)
+    connected = pq.connect(conn_info.replication)
+    if connected.is_a?(DBError)
+      pq.close
+      return ConnectionRefused.new(connected.message, connected)
+    end
+    PGConnection.new(options, pq)
+  end
+
+  def build_prepared_statement(query : String) : Statement | DBError
+    PGStatement.new(self, @connection, query)
+  end
+
+  def build_unprepared_statement(query : String) : Statement | DBError
+    PGStatement.new(self, @connection, query)
+  end
+
+  # :inherit:
+  def driver_name : String
+    "postgres"
+  end
+
+  # :inherit:
+  def server_name : String?
+    "PostgreSQL"
+  end
+
+  # :inherit:
+  def server_version : String?
+    @connection.server_parameters["server_version"]?
+  end
+
+  # Execute several statements. No results are returned.
+  def exec_all(query : String) : Nil | DBError
+    @connection.simple_query(query)
+  end
+
+  # Execute a "COPY" query and return an object to read from or write to,
+  # depending on the query.
+  #
+  # ```
+  # data = conn.exec_copy("COPY table TO STDOUT")!.gets_to_end!
+  # ```
+  #
+  # ```
+  # writer = conn.exec_copy("COPY table FROM STDIN")!
+  # writer << data
+  # writer.close!
+  # ```
+  def exec_copy(query : String) : CopyResult | DBError
+    CopyResult.open(@connection, query)
+  end
+
+  # Set the callback block for notices and errors.
+  def on_notice(&on_notice_proc : Notice -> Nil) : Nil
+    @connection.notice_handler = on_notice_proc
+  end
+
+  # Set the callback block for notifications from Listen/Notify.
+  def on_notification(&on_notification_proc : Notification -> Nil) : Nil
+    @connection.notification_handler = on_notification_proc
+  end
+
+  # Sends `LISTEN` for each of *channels*.
+  def listen(channels : Array(String)) : Nil | DBError
+    channels.each do |c|
+      listened = exec_all("LISTEN " + escape_identifier(c))
+      return listened if listened.is_a?(DBError)
+    end
+    nil
+  end
+
+  # Reads notifications until the connection is closed, handing each to the
+  # `on_notification` callback.
+  def listen_loop : Nil | DBError
+    @connection.read_async_frame_loop
+  end
+
+  # The server's version, from its `server_version` parameter.
+  def version : NamedTuple(major: Int32, minor: Int32, patch: Int32)
+    text = (server_version || "0").partition(' ')[0]
+    vers = text.split('.').map { |part| part.to_i? || 0 }
+    {major: vers[0]? || 0, minor: vers[1]? || 0, patch: vers[2]? || 0}
+  end
+
+  protected def do_close : Nil | DBError
+    closed = super
+    @connection.close
+    closed
+  end
+end
+
+impl EscapeHelper for PGConnection
+end
+
+pub class PGConnectionBuilder < ConnectionBuilder
+  def initialize(@options : Connection::Options, @conn_info : ConnInfo)
+  end
+
+  def build : Connection | DBError
+    PGConnection.open(@options, @conn_info)
+  end
+end
+
+pub class PGDriver < Driver
+  def connection_builder(uri : URI) : ConnectionBuilder | DBError
+    params = Params.parse(uri.query || "")
+    PGConnectionBuilder.new(connection_options(params)!, ConnInfo.from_uri(uri)!)
+  end
+end
+
+::Db::Db.register_driver "postgres", PGDriver
+::Db::Db.register_driver "postgresql", PGDriver
