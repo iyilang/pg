@@ -1,0 +1,45 @@
+# Composite values (`pg/record.iyi`). crystal-pg has no spec for its
+# `PG::Record`, which could not be read; these hold the reading this port
+# gives it.
+module pg/record_test
+
+import db/db/value::{DBValue}
+import db/db/spec::{describe, it}
+import pg/record::{Record, RecordDecoder}
+import pg/decoder::{Decoders}
+import pg/testing/spec_helper::*
+
+describe "PG::Record" do
+  it "reads an anonymous row field by field, NULL as nil" do
+    value = PG_DB.scalar("select row(1, 'a'::text, null::int, 2.5::float8)").or_panic
+    assert value.is_a?(Record)
+    record = value.as(Record)
+    assert record.size == 4
+    assert record[0] == 1
+    assert record[1] == "a"
+    assert record[2].nil?
+    assert record[3] == 2.5
+  end
+
+  it "reads as Record when asked" do
+    record = PG_DB.query_one("select row(7, 'x'::text)", as: Record).or_panic
+    assert record == Record.new([7, "x"] of DBValue)
+  end
+
+  it "reads nested rows" do
+    record = PG_DB.query_one("select row(1, row(2, 'b'::text))", as: Record).or_panic
+    assert record[1] == Record.new([2, "b"] of DBValue)
+  end
+
+  it "reads a named composite type once its OID is registered" do
+    with_connection do |conn|
+      conn.exec("drop type if exists record_test_pair").or_panic
+      conn.exec("create type record_test_pair as (x int, y text)").or_panic
+      oid = conn.query_one("select 'record_test_pair'::regtype::oid", as: UInt32).or_panic
+      Decoders.register_decoder RecordDecoder.new([oid.to_i32])
+      record = conn.query_one("select (3, 'z')::record_test_pair", as: Record).or_panic
+      assert record == Record.new([3, "z"] of DBValue)
+      conn.exec("drop type record_test_pair").or_panic
+    end
+  end
+end
