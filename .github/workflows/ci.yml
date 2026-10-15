@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: iyi_pg_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The oldest iyi this release supports (README, Requirements).
+      IYI_VERSION: 0.17.0
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1/iyi_pg_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install iyi
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/iyilang/iyi/master/install.sh | IYI_PREFIX="$HOME/.iyi" sh
+          echo "$HOME/.iyi/bin" >> "$GITHUB_PATH"
+
+      - run: iyi version
+
+      - name: Test
+        run: iyi test pg
+
+      # No "test from artifacts" step as iyi-db has: iyi 0.17.0 does not write
+      # artifacts for a required package's modules (`--emit-iyimod` help,
+      # SPEC.md III.7 step 5), so a build with `--use-iyimod` cannot find
+      # iyi-db's.
+
+      - name: Build the examples
+        run: |
+          for program in examples/*.iyi; do
+            echo "building $program"
+            iyi build "$program" -o "$RUNNER_TEMP/example"
+          done
+
+      - name: Check formatting
+        run: iyi fmt --check pg examples
