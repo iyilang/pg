@@ -1,0 +1,225 @@
+# crystal-pg's spec/pg/connection_spec.cr.
+module pg/connection_test
+
+import std/time::{Time}
+import std/uri::{URI}
+import db/db/db
+import db/db/errors::*
+import db/db/spec::{describe, it, expect_error}
+import pg/pq/frame::{Notice, Notification}
+import pg/core::{PGConnection}
+import pg/pg
+import pg/testing/spec_helper::*
+
+describe "PG::Connection#initialize" do
+  it "answers ConnectionRefused on bad connections" do
+    expect_error(::Db::Db.open("postgres://localhost:5433"), ConnectionRefused)
+    nil
+  end
+
+  it "sets the application name" do
+    uri = URI.parse(DB_URL)
+    uri.query = "application_name=specs"
+    with_db_at(uri.to_s) do |db|
+      assert db.query_one("SHOW application_name", as: String).or_panic == "specs"
+    end
+  end
+end
+
+describe "PG::Connection#driver_name" do
+  it "returns the name the driver is registered with" do
+    with_connection do |conn|
+      assert conn.driver_name == "postgres"
+    end
+  end
+end
+
+describe "PG::Connection#server_name" do
+  it "returns PostgreSQL" do
+    with_connection do |conn|
+      assert conn.server_name == "PostgreSQL"
+    end
+  end
+end
+
+describe "PG::Connection#server_version" do
+  it "returns the version reported by the server" do
+    with_connection do |conn|
+      assert conn.server_version == conn.scalar("SHOW server_version").or_panic
+    end
+  end
+end
+
+describe "PG::Connection#on_notice" do
+  it "sends notices to on_notice" do
+    last_notice : Notice? = nil
+    PG_DB.using_connection do |conn|
+      conn.as(PGConnection).on_notice do |notice|
+        last_notice = notice
+        nil
+      end
+      nil
+    end.or_panic
+
+    PG_DB.using_connection do |conn|
+      conn.as(PGConnection).exec_all(<<-SQL).or_panic
+        SET client_min_messages TO notice;
+        DO language plpgsql $$
+        BEGIN
+          RAISE NOTICE 'hello, world!';
+        END
+        $$;
+      SQL
+      nil
+    end.or_panic
+
+    if notice = last_notice
+      assert notice.to_s == "NOTICE:  hello, world!\n", notice.to_s
+    else
+      raise "no notice"
+    end
+  end
+end
+
+describe "PG::Connection#on_notification" do
+  it "does listen/notify within same connection" do
+    last_note : Notification? = nil
+    with_db do |db|
+      db.using_connection do |conn|
+        conn.as(PGConnection).on_notification { |note| last_note = note; nil }
+        conn.exec("listen somechannel").or_panic
+        conn.exec("notify somechannel, 'do a thing'").or_panic
+        nil
+      end.or_panic
+    end
+
+    if note = last_note
+      assert note.channel == "somechannel"
+      assert note.payload == "do a thing"
+    else
+      raise "no notification"
+    end
+  end
+end
+
+describe "PG#listen" do
+  it "opens a special listen only connection" do
+    got = false
+    ch = Channel(Nil).new
+    group do |g|
+      conn = ::Pg::Pg.connect_listen(DB_URL, ["foo", "bar"], g) do |_|
+        got = true
+        ch.send(nil)
+        nil
+      end.or_panic
+      defer conn.close
+
+      assert got == false
+
+      PG_DB.exec("notify wrong, 'hello'").or_panic
+      assert got == false
+
+      PG_DB.exec("notify foo, 'hello'").or_panic
+      ch.receive
+      assert got == true
+      got = false
+
+      PG_DB.exec("notify bar, 'hello'").or_panic
+      ch.receive
+      assert got == true
+    end
+  end
+end
+
+describe "PG#read_next_row_start" do
+  it "handles reading a notice" do
+    with_connection do |db|
+      db.exec("SET client_min_messages TO notice").or_panic
+      db.exec(<<-SQL).or_panic
+        CREATE OR REPLACE FUNCTION foo() RETURNS integer AS $$
+        BEGIN
+          RAISE NOTICE 'foo';
+          RAISE NOTICE 'bar';
+          RETURN 42;
+        END;
+        $$ LANGUAGE plpgsql;
+        SQL
+
+      received_notices = [] of String
+      db.on_notice do |notice|
+        received_notices << notice.message
+        nil
+      end
+      assert db.scalar("SELECT foo()").or_panic == 42
+      assert received_notices == ["foo", "bar"], received_notices.to_s
+
+      db.exec("DROP FUNCTION foo()").or_panic
+    end
+  end
+end
+
+# crystal-pg reads `now()` into a `Time` in the session's `TimeZone`. iyi's
+# `Time` is UTC-only, so this checks instead that the server parameter
+# follows `SET TIME ZONE` and that `now()` is the same instant whatever the
+# session's zone.
+describe "PG#time_zone" do
+  it "reads the same instant under any session time zone" do
+    with_connection do |db|
+      db.exec("SET TIME ZONE 'America/Los_Angeles'").or_panic
+      assert db.connection.server_parameters["TimeZone"]? == "America/Los_Angeles"
+
+      db.transaction do |_|
+        la = db.query_one("SELECT now()", as: Time).or_panic
+        db.exec("SET LOCAL TIME ZONE 'America/New_York'").or_panic
+        assert db.connection.server_parameters["TimeZone"]? == "America/New_York"
+        ny = db.query_one("SELECT now()", as: Time).or_panic
+        db.exec("SET LOCAL TIME ZONE 'UTC'").or_panic
+        utc = db.query_one("SELECT now()", as: Time).or_panic
+        assert la == utc, "#{la} != #{utc}"
+        assert ny == utc, "#{ny} != #{utc}"
+        nil
+      end.or_panic
+
+      assert db.connection.server_parameters["TimeZone"]? == "America/Los_Angeles"
+    end
+  end
+end
+
+# crystal-pg's "#clear_time_zone_cache" is omitted: with UTC-only `Time`
+# there is no time zone cache to clear.
+
+describe "PG COPY" do
+  it "properly handles partial reads and consumes data on early close" do
+    with_connection do |db|
+      io = db.exec_copy("COPY (VALUES (1), (333)) TO STDOUT").or_panic
+      assert io.read_char == '1'
+      assert io.read_char == '\n'
+      assert io.read_char == '3'
+      assert io.read_char == '3'
+      io.close.or_panic
+      assert db.scalar("select 1").or_panic == 1
+    end
+  end
+
+  # crystal-pg wrote this one as `if "..."`, which always ran its body.
+  it "survives a COPY FROM STDIN and COPY TO STDOUT round-trip" do
+    with_connection do |db|
+      data = "123\tdata\n\\N\t\\N\n"
+      db.exec("CREATE TEMPORARY TABLE IF NOT EXISTS copy_test (a int, b text)").or_panic
+
+      wr = db.exec_copy("COPY copy_test FROM STDIN").or_panic
+      (wr << data).or_panic
+      wr.close.or_panic
+
+      rd = db.exec_copy("COPY copy_test TO STDOUT").or_panic
+      read = rd.gets_to_end.or_panic
+      assert read == data, read.inspect
+
+      db.exec("DROP TABLE copy_test").or_panic
+    end
+  end
+end
+
+def with_db_at(url : String, & : ::Db::Core::Database -> Nil) : Nil
+  ::Db::Db.open(url) { |db| yield db }.or_panic
+end
