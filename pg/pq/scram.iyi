@@ -1,0 +1,136 @@
+# The password exchanges: SCRAM-SHA-256 (RFC 5802, RFC 7677) and the md5
+# challenge. crystal-pg took HMAC and PBKDF2 from OpenSSL; iyi has no TLS
+# library, so they are written here over `std/digest`'s SHA-256.
+#
+# SCRAM-SHA-256-PLUS binds the exchange to a TLS channel, and iyi has none,
+# so only the plain mechanism is offered.
+module pg/pq/scram
+
+import std/int
+import std/digest::{SHA256, MD5}
+import std/base64::{Base64}
+import std/random::{Random}
+import std/text
+import pg/pq/errors::{ConnectionError}
+
+# The bytes of *data* as a string, which the digests take.
+pub def bytes_string(data : Array(UInt8)) : String
+  String.new(data.size) do |buffer|
+    data.each_with_index { |byte, index| buffer[index] = byte }
+  end
+end
+
+# HMAC-SHA-256 of *message* under *key* (RFC 2104).
+pub def hmac_sha256(key : String, message : String) : String
+  block = key.bytesize > 64 ? bytes_string(SHA256.hash_bytes(key)) : key
+  kbytes = block.bytes
+  ipad = String.new(64) do |buffer|
+    64.times { |i| buffer[i] = (i < kbytes.size ? kbytes[i] : 0_u8) ^ 0x36_u8 }
+  end
+  opad = String.new(64) do |buffer|
+    64.times { |i| buffer[i] = (i < kbytes.size ? kbytes[i] : 0_u8) ^ 0x5c_u8 }
+  end
+  inner = bytes_string(SHA256.hash_bytes(ipad + message))
+  bytes_string(SHA256.hash_bytes(opad + inner))
+end
+
+# PBKDF2 with HMAC-SHA-256, one 32-byte block: SCRAM's `Hi()`.
+pub def pbkdf2_sha256(password : String, salt : String, iterations : Int32) : String
+  first = String.new(4) do |buffer|
+    buffer[0] = 0_u8
+    buffer[1] = 0_u8
+    buffer[2] = 0_u8
+    buffer[3] = 1_u8
+  end
+  u = hmac_sha256(password, salt + first)
+  result = u.bytes
+  (iterations - 1).times do
+    u = hmac_sha256(password, u)
+    ubytes = u.bytes
+    32.times { |i| result[i] = result[i] ^ ubytes[i] }
+  end
+  bytes_string(result)
+end
+
+# The answer to an md5 challenge: `md5` and the hex digest of the hex
+# digest of password and user, salted.
+pub def md5_password(user : String, password : String, salt : String) : String
+  inner = MD5.hexdigest(password + user)
+  "md5" + MD5.hexdigest(inner + salt)
+end
+
+# One SCRAM-SHA-256 exchange, from the client's first message to the check
+# of the server's signature.
+pub class SaslContext
+  SCRAM_NAME      = "SCRAM-SHA-256"
+  SCRAM_PLUS_NAME = "SCRAM-SHA-256-PLUS"
+
+  getter name : String
+  getter client_first_msg : String
+  @client_nonce : String
+  @server_sig : String?
+
+  def initialize(@password : String, nonce : String? = nil)
+    @client_nonce = nonce || SaslContext.nonce
+    @name = SCRAM_NAME
+    @client_first_msg = "n,,n=,r=#{@client_nonce}"
+    @server_sig = nil
+  end
+
+  # Eighteen random bytes, URL-safe base64: what crystal-pg sent. The
+  # generator is seeded from the platform's entropy.
+  def self.nonce : String
+    random = Random.new
+    raw = String.new(18) do |buffer|
+      18.times { |i| buffer[i] = (random.next_u & 0xFF_u32).to_u8 }
+    end
+    Base64.urlsafe_encode(raw)
+  end
+
+  # The client-final-message for the server-first-message *body*.
+  def generate_client_final_message(server_first_msg : String) : String | ConnectionError
+    params = server_first_msg.split(',')
+    r = attribute(params, 'r')
+    s = attribute(params, 's')
+    i = attribute(params, 'i')
+    if r.nil? || s.nil? || i.nil?
+      return ConnectionError.new("SASL: malformed server-first-message")
+    end
+    iterations = i.to_i?
+    return ConnectionError.new("SASL: malformed iteration count") if iterations.nil? || iterations < 1
+    unless r.starts_with?(@client_nonce)
+      return ConnectionError.new("SASL: scram server nonce does not start with client nonce")
+    end
+
+    # biws == base64 of "n,,"
+    client_final_msg_without_proof = "c=biws,r=#{r}"
+    salted_pass = pbkdf2_sha256(@password, Base64.decode(s), iterations)
+    server_key = hmac_sha256(salted_pass, "Server Key")
+    client_key = hmac_sha256(salted_pass, "Client Key")
+    auth_msg = "n=,r=#{@client_nonce},#{server_first_msg},#{client_final_msg_without_proof}"
+    stored_key = bytes_string(SHA256.hash_bytes(client_key))
+    client_sig = hmac_sha256(stored_key, auth_msg)
+    @server_sig = hmac_sha256(server_key, auth_msg)
+    kb = client_key.bytes
+    sb = client_sig.bytes
+    proof = String.new(32) do |buffer|
+      32.times { |index| buffer[index] = kb[index] ^ sb[index] }
+    end
+    "#{client_final_msg_without_proof},p=#{Base64.encode(proof)}"
+  end
+
+  # Checks the server-final-message *server_message* (`v=...`).
+  def verify_server_signature(server_message : String) : Nil | ConnectionError
+    expected = @server_sig
+    return ConnectionError.new("SASL: no client-final-message was sent") if expected.nil?
+    unless server_message.starts_with?("v=") && server_message[2..-1] == Base64.encode(expected)
+      return ConnectionError.new("server signature does not match")
+    end
+    nil
+  end
+
+  private def attribute(params : Array(String), key : Char) : String?
+    found = params.find { |p| p.bytesize >= 2 && p[0] == key && p[1] == '=' }
+    found.nil? ? nil : found[2..-1]
+  end
+end
