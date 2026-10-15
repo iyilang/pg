@@ -1,0 +1,106 @@
+# The PostgreSQL driver for iyi-db: a port of crystal-pg
+# (https://github.com/will/crystal-pg) 0.31.0, written in iyi.
+#
+# Importing this module registers the driver for `postgres://` and
+# `postgresql://` URIs:
+#
+# ```
+# import db/db/db
+# import pg/pg/pg
+#
+# Db::Db.open("postgres://user:pass@localhost/mydb") do |db|
+#   puts db.scalar("select 1")!
+# end
+# ```
+module pg/pg
+
+pub import pg/core
+
+import std/uri::{URI}
+import db/db/db
+import db/db/errors::{DBError}
+import db/db/core::{Database}
+import pg/pq/frame::{Notification}
+import pg/core::{PGConnection}
+
+pub VERSION = "0.1.0"
+
+# Establish a connection pool to the database.
+pub def connect(url : String) : Database | DBError
+  ::Db::Db.open(url)
+end
+
+# Establish a special listen-only connection to the database, and read its
+# notifications in a task of *group*: each is handed to the block, until the
+# connection is closed.
+#
+# ```
+# group do |g|
+#   conn = Pg::Pg.connect_listen(ENV["DATABASE_URL"], ["foo", "bar"], g) do |notification|
+#     pp notification.channel, notification.payload, notification.pid
+#   end!
+#   # ...
+#   conn.close
+# end
+# ```
+#
+# crystal-pg spawned a fiber of its own when not `blocking`; an iyi task
+# cannot outlive the group that started it (SPEC.md III.4.1), so the group
+# is the caller's.
+pub def connect_listen(url : String, channels : Array(String), group : IyiGroup, &blk : Notification -> Nil) : ListenConnection | DBError
+  conn = ListenConnection.open(url, channels, &blk)!
+  group.spawn do
+    conn.listen
+    0
+  end
+  conn
+end
+
+# Establish a special listen-only connection to the database and read its
+# notifications here, handing each to the block, until the connection is
+# closed or fails. crystal-pg's `blocking: true`.
+pub def connect_listen(url : String, channels : Array(String), &blk : Notification -> Nil) : Nil | DBError
+  conn = ListenConnection.open(url, channels, &blk)!
+  conn.listen
+end
+
+# A connection that only `LISTEN`s.
+pub class ListenConnection
+  @conn : PGConnection
+
+  def initialize(@conn : PGConnection)
+  end
+
+  # Connects to *url* and listens on *channels*, handing notifications to
+  # *blk* once `#listen` reads them.
+  def self.open(url : String, channels : Array(String), &blk : Notification -> Nil) : ListenConnection | DBError
+    connection = ::Db::Db.connect(url)!
+    unless connection.is_a?(PGConnection)
+      connection.close
+      return DBError.new("#{url} is not a PostgreSQL connection")
+    end
+    connection.on_notification(&blk)
+    listened = connection.listen(channels)
+    if listened.is_a?(DBError)
+      connection.close
+      return listened
+    end
+    ListenConnection.new(connection)
+  end
+
+  # Reads notifications until the connection is closed.
+  def listen : Nil | DBError
+    @conn.listen_loop
+  end
+
+  # The connection itself.
+  def connection : PGConnection
+    @conn
+  end
+
+  # Close the connection.
+  def close : Nil
+    @conn.close
+    nil
+  end
+end
