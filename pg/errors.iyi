@@ -1,0 +1,13 @@
+# The driver's own errors: crystal-pg's `PG::Error` and `PG::RuntimeError`,
+# as `DBError`s.
+module pg/errors
+
+import db/db/errors::{DBError}
+
+pub class PGError < DBError
+end
+
+# A value the driver cannot read as asked: a NULL where a value was
+# expected, an array of another element type, a lower bound below 1.
+pub class RuntimeError < PGError
+end

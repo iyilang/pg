@@ -1,0 +1,181 @@
+# PostgreSQL's geometric types: crystal-pg's `PG::Geo`.
+#
+# https://www.postgresql.org/docs/current/datatype-geometric.html
+module pg/geo
+
+import std/float
+import db/db/value::{CustomValue}
+
+pub class Point < CustomValue
+  getter x : Float64
+  getter y : Float64
+
+  def initialize(@x : Float64, @y : Float64)
+  end
+
+  def ==(other : Point) : Bool
+    x == other.x && y == other.y
+  end
+
+  def to_s : String
+    "(#{x},#{y})"
+  end
+
+  def inspect : String
+    "PG::Geo::Point(x: #{x}, y: #{y})"
+  end
+end
+
+# The line `ax + by + c = 0`.
+pub class Line < CustomValue
+  getter a : Float64
+  getter b : Float64
+  getter c : Float64
+
+  def initialize(@a : Float64, @b : Float64, @c : Float64)
+  end
+
+  def ==(other : Line) : Bool
+    a == other.a && b == other.b && c == other.c
+  end
+
+  def to_s : String
+    "{#{a},#{b},#{c}}"
+  end
+
+  def inspect : String
+    "PG::Geo::Line(a: #{a}, b: #{b}, c: #{c})"
+  end
+end
+
+pub class Circle < CustomValue
+  getter x : Float64
+  getter y : Float64
+  getter radius : Float64
+
+  def initialize(@x : Float64, @y : Float64, @radius : Float64)
+  end
+
+  def ==(other : Circle) : Bool
+    x == other.x && y == other.y && radius == other.radius
+  end
+
+  def to_s : String
+    "<(#{x},#{y}),#{radius}>"
+  end
+
+  def inspect : String
+    "PG::Geo::Circle(x: #{x}, y: #{y}, radius: #{radius})"
+  end
+end
+
+pub class LineSegment < CustomValue
+  getter x1 : Float64
+  getter y1 : Float64
+  getter x2 : Float64
+  getter y2 : Float64
+
+  def initialize(@x1 : Float64, @y1 : Float64, @x2 : Float64, @y2 : Float64)
+  end
+
+  def ==(other : LineSegment) : Bool
+    x1 == other.x1 && y1 == other.y1 && x2 == other.x2 && y2 == other.y2
+  end
+
+  def to_s : String
+    "((#{x1},#{y1}),(#{x2},#{y2}))"
+  end
+
+  def inspect : String
+    "PG::Geo::LineSegment(x1: #{x1}, y1: #{y1}, x2: #{x2}, y2: #{y2})"
+  end
+end
+
+pub class Box < CustomValue
+  getter x1 : Float64
+  getter y1 : Float64
+  getter x2 : Float64
+  getter y2 : Float64
+
+  def initialize(@x1 : Float64, @y1 : Float64, @x2 : Float64, @y2 : Float64)
+  end
+
+  def ==(other : Box) : Bool
+    x1 == other.x1 && y1 == other.y1 && x2 == other.x2 && y2 == other.y2
+  end
+
+  def to_s : String
+    "((#{x1},#{y1}),(#{x2},#{y2}))"
+  end
+
+  def inspect : String
+    "PG::Geo::Box(x1: #{x1}, y1: #{y1}, x2: #{x2}, y2: #{y2})"
+  end
+end
+
+pub class Path < CustomValue
+  getter points : Array(Point)
+
+  def initialize(@points : Array(Point), @closed : Bool)
+  end
+
+  def closed? : Bool
+    @closed
+  end
+
+  def open? : Bool
+    !closed?
+  end
+
+  def ==(other : Path) : Bool
+    closed? == other.closed? && Geo.same_points?(points, other.points)
+  end
+
+  def to_s : String
+    Geo.points_text(closed? ? "(" : "[", points, closed? ? ")" : "]")
+  end
+
+  def inspect : String
+    "PG::Geo::Path(#{to_s})"
+  end
+end
+
+pub class Polygon < CustomValue
+  getter points : Array(Point)
+
+  def initialize(@points : Array(Point))
+  end
+
+  def ==(other : Polygon) : Bool
+    Geo.same_points?(points, other.points)
+  end
+
+  def to_s : String
+    Geo.points_text("(", points, ")")
+  end
+
+  def inspect : String
+    "PG::Geo::Polygon(#{to_s})"
+  end
+end
+
+# Helpers the path types share.
+pub struct Geo
+  def self.same_points?(a : Array(Point), b : Array(Point)) : Bool
+    return false unless a.size == b.size
+    a.size.times { |i| return false unless a[i] == b[i] }
+    true
+  end
+
+  # The points between *left* and *right*, as the text format writes them.
+  def self.points_text(left : String, points : Array(Point), right : String) : String
+    String.build do |io|
+      io << left
+      points.each_with_index do |point, i|
+        io << "," if i > 0
+        io << "(" << point.x << "," << point.y << ")"
+      end
+      io << right
+    end
+  end
+end

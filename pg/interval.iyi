@@ -1,0 +1,67 @@
+# PostgreSQL's `interval`.
+module pg/interval
+
+import std/int
+import std/time::{Span}
+import db/db/value::{CustomValue}
+import db/db/errors::{DBError, ArgumentError}
+
+# A number of months, the part of an interval a `Span` cannot hold: Crystal's
+# `Time::MonthSpan`, which iyi's `std/time` does not have.
+pub struct MonthSpan
+  getter value : Int64
+
+  def initialize(value : Int32 | Int64)
+    @value = value.to_i64
+  end
+
+  def ==(other : MonthSpan) : Bool
+    value == other.value
+  end
+end
+
+# A representation for INTERVAL data type.
+# https://www.postgresql.org/docs/current/datatype-datetime.html
+pub class Interval < CustomValue
+  getter microseconds : Int64
+  getter days : Int32
+  getter months : Int32
+
+  def initialize(@microseconds : Int64 = 0_i64, @days : Int32 = 0, @months : Int32 = 0)
+  end
+
+  def ==(other : Interval) : Bool
+    microseconds == other.microseconds && days == other.days && months == other.months
+  end
+
+  # A `Span` of this interval. Months have no fixed length, so an interval
+  # with months answers `ArgumentError` unless *approx_months* says how many
+  # days one is.
+  def to_span(approx_months : Int32? = nil) : Span | DBError
+    d = days.to_i64
+
+    unless months == 0
+      if approx_months
+        d += approx_months.to_i64 * months.to_i64
+      else
+        return ArgumentError.new("Cannot represent a PG::Interval contaning months as Time::Span without approximating months to days")
+      end
+    end
+
+    seconds = microseconds // 1_000_000
+    nanoseconds = (microseconds % 1_000_000) * 1_000
+    Span.new(days: d, seconds: seconds, nanoseconds: nanoseconds)
+  end
+
+  def to_month_span : MonthSpan
+    MonthSpan.new(months)
+  end
+
+  def to_s : String
+    "#{months} months #{days} days #{microseconds} microseconds"
+  end
+
+  def inspect : String
+    "PG::Interval(#{to_s})"
+  end
+end
