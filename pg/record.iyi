@@ -1,0 +1,79 @@
+# Composite values: `ROW(1, 'a')`, a table's row type, a `CREATE TYPE ... AS
+# (...)`. crystal-pg's `PG::Record`.
+#
+# crystal-pg declared `PG::Record(*T)` with a reader no decoder ever
+# produced, so reading one could not succeed. Here a `record` column (OID
+# 2249) reads as a `Record` holding each field decoded by its own OID, and
+# `RecordDecoder.new([oid])` registers the same reading for a named
+# composite type, whose OID `SELECT 'mytype'::regtype::oid` tells.
+module pg/record
+
+import std/int
+import db/db/errors::{DBError}
+import db/db/value::{DBValue, CustomValue}
+import pg/pq/stream::{ByteSource}
+import pg/decoder::{Decoder, Decoders}
+
+# The fields of one composite value, in order; `nil` for a NULL field.
+pub class Record < CustomValue
+  getter data : Array(DBValue)
+
+  def initialize(@data : Array(DBValue))
+  end
+
+  def size : Int32
+    @data.size
+  end
+
+  def [](index : Int32) : DBValue
+    @data[index]
+  end
+
+  def ==(other : Record) : Bool
+    @data == other.data
+  end
+
+  def to_s : String
+    "(" + @data.map { |value| value.nil? ? "" : value.to_s }.join(",") + ")"
+  end
+
+  def inspect : String
+    "PG::Record(#{@data.inspect})"
+  end
+end
+
+# Reads the binary composite format: the field count, then each field's
+# type OID, its size (-1 for NULL) and its bytes.
+pub class RecordDecoder < Decoder
+  RECORD_OID = 2249
+
+  getter oids : Array(Int32)
+
+  def initialize(@oids : Array(Int32) = [RECORD_OID])
+  end
+
+  def type_name : String
+    "PG::Record"
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    count = io.read_i32!
+    values = [] of DBValue
+    count.times do
+      field_oid = io.read_i32
+      return field_oid if field_oid.is_a?(DBError)
+      size = io.read_i32
+      return size if size.is_a?(DBError)
+      if size == -1
+        values << nil
+      else
+        value = Decoders.from_oid(field_oid).decode(io, size, field_oid)
+        return value if value.is_a?(DBError)
+        values << value
+      end
+    end
+    Record.new(values)
+  end
+end
+
+Decoders.register_decoder RecordDecoder.new
