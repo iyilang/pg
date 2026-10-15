@@ -1,0 +1,489 @@
+# One session of the PostgreSQL frontend/backend protocol, version 3: the
+# socket, the startup and authentication, and the messages a statement
+# sends and reads. crystal-pg's `PQ::Connection`.
+#
+# Every read answers its failure: `StreamError` when the socket fails,
+# `PQError` when the server answers an `ErrorResponse`, `ConnectionError`
+# when the session cannot go on.
+module pg/pq/connection
+
+import std/int
+import std/text
+import std/path::{Path}
+import std/file
+import std/socket::{IyiSocket, SocketError}
+import std/slice::{Slice, Bytes}
+import db/db/errors::{DBError}
+import pg/pq/errors::*
+import pg/pq/stream::{Stream}
+import pg/pq/conninfo::{ConnInfo}
+import pg/pq/frame::*
+import pg/pq/param::{Param}
+import pg/pq/scram::{SaslContext, md5_password}
+
+pub class PQConnection
+  getter stream : Stream
+  getter server_parameters : Hash(String, String)
+  getter conninfo : ConnInfo
+  property notice_handler : Proc(Notice, Nil)
+  property notification_handler : Proc(Notification, Nil)
+  @established = false
+
+  def initialize(@stream : Stream, @conninfo : ConnInfo)
+    @server_parameters = {} of String => String
+    @notice_handler = ->(notice : Notice) { nil }
+    @notification_handler = ->(notification : Notification) { nil }
+  end
+
+  # Opens the socket *conninfo* names: a Unix socket in the directory its
+  # host names when that is a path, TCP otherwise.
+  #
+  # iyi has no TLS, so SSL is never negotiated: `sslmode` `prefer` and
+  # `allow` go on unencrypted, as libpq does when the server declines,
+  # and `require`, `verify-ca` and `verify-full` are refused here.
+  def self.open(conninfo : ConnInfo) : PQConnection | ConnectionError
+    if conninfo.sslmode.in?(:require, :"verify-ca", :"verify-full")
+      return ConnectionError.new("sslmode=#{conninfo.sslmode} needs TLS, which this driver does not support")
+    end
+
+    socket = if Path.new(conninfo.host).absolute? && conninfo.host.starts_with?('/')
+               socket_path = File.join(conninfo.host, ".s.PGSQL.#{conninfo.port}")
+               IyiSocket.connect_unix(socket_path)
+             else
+               IyiSocket.connect(conninfo.host, conninfo.port)
+             end
+    case socket
+    when IyiSocket
+      PQConnection.new(Stream.new(socket), conninfo)
+    when SocketError
+      ConnectionError.new("Cannot establish connection: #{socket.reason}")
+    else
+      ConnectionError.new("Cannot establish connection: cancelled")
+    end
+  end
+
+  def soc : Stream
+    @stream
+  end
+
+  def closed? : Bool
+    @stream.closed?
+  end
+
+  def close : Nil
+    return if @stream.closed?
+    send_terminate_message
+    @stream.flush
+    @stream.close
+  end
+
+  # ------------------------------------------------------------ reading
+
+  def read_i32 : Int32 | DBError
+    @stream.read_i32
+  end
+
+  def read_i16 : Int16 | DBError
+    @stream.read_i16
+  end
+
+  def read_bytes(count : Int32) : Bytes | DBError
+    @stream.read_bytes(count)
+  end
+
+  def read_direct(target : Pointer(UInt8), count : Int32) : Int32 | DBError
+    @stream.read_some(target, count)
+  end
+
+  def skip_bytes(count : Int32) : Nil | DBError
+    @stream.skip(count)
+  end
+
+  # The next message, past the ones a session handles on its own: notices,
+  # notifications and parameter changes. An `ErrorResponse` is answered as
+  # a `PQError`.
+  def read : Frame | DBError
+    read(@stream.read_char!)
+  end
+
+  def read(frame_type : Char) : Frame | DBError
+    type = frame_type
+    while true
+      frame = read_one_frame(type)!
+      handled = handle_async_frames(frame)!
+      return frame unless handled
+      type = @stream.read_char!
+    end
+  end
+
+  # Reads messages until the socket is closed, handing notices and
+  # notifications to their handlers: the loop of a `LISTEN`ing connection.
+  def read_async_frame_loop : Nil | DBError
+    while true
+      break if @stream.closed?
+      type = @stream.read_char
+      if type.is_a?(DBError)
+        break if @stream.closed?
+        return type
+      end
+      frame = read_one_frame(type)
+      if frame.is_a?(DBError)
+        break if @stream.closed?
+        return frame
+      end
+      handled = handle_async_frames(frame)
+      return handled if handled.is_a?(DBError)
+    end
+    nil
+  end
+
+  private def read_one_frame(frame_type : Char) : Frame | DBError
+    size = @stream.read_i32!
+    slice = @stream.read_bytes(size - 4)!
+    Frame.new(frame_type, slice)
+  end
+
+  # `true` when *frame* was handled here and the caller reads the next one.
+  private def handle_async_frames(frame : Frame) : Bool | DBError
+    case frame
+    when Frame::ErrorResponse
+      expect_frame(Frame::ReadyForQuery)! if @established
+      @notice_handler.call(frame.as_notice)
+      PQError.new(frame.fields)
+    when Frame::NotificationResponse
+      @notification_handler.call(frame.as_notification)
+      true
+    when Frame::NoticeResponse
+      @notice_handler.call(frame.as_notice)
+      true
+    when Frame::ParameterStatus
+      @server_parameters[frame.key] = frame.value
+      case frame.key
+      when "client_encoding"
+        if frame.value.upcase != "UTF8"
+          return ConnectionError.new(
+            "Only UTF8 is supported for client_encoding, got: #{frame.value.inspect}")
+        end
+      when "integer_datetimes"
+        if frame.value != "on"
+          return ConnectionError.new(
+            "Only on is supported for integer_datetimes, got: #{frame.value.inspect}")
+        end
+      else
+        # nothing to check
+      end
+      true
+    else
+      false
+    end
+  end
+
+  # The next message, which must be a *frame_class*; a type already read
+  # is passed as *type*.
+  def expect_frame(frame_class : T.class, type : Char? = nil) : T | DBError forall T
+    f = type ? read(type)! : read!
+    return f.as(T) if f.is_a?(T)
+    DBError.new("Expected #{frame_class} but got #{f}")
+  end
+
+  # Whether a `DataRow` follows; at the end of the rows the
+  # `CommandComplete` is read.
+  def read_next_row_start : Bool | DBError
+    type = @stream.read_char!
+
+    while type == 'N'
+      # NoticeResponse
+      frame = read_one_frame('N')!
+      handle_async_frames(frame)!
+      type = @stream.read_char!
+    end
+
+    if type == 'D'
+      true
+    else
+      expect_frame(Frame::CommandComplete, type)!
+      false
+    end
+  end
+
+  # Reads one `DataRow`, its type byte already read, and yields its columns:
+  # each one's bytes, nil for NULL.
+  def read_data_row(& : Array(Bytes?) -> Nil) : Nil | DBError
+    @stream.read_i32! # size
+    ncols = @stream.read_i16!
+    row = [] of Bytes?
+    ncols.to_i32.times do
+      col_size = @stream.read_i32
+      return col_size if col_size.is_a?(DBError)
+      if col_size == -1
+        row << nil
+      else
+        bytes = @stream.read_bytes(col_size)
+        return bytes if bytes.is_a?(DBError)
+        row << bytes
+      end
+    end
+    yield row
+    nil
+  end
+
+  # Reads every `DataRow` and the `CommandComplete` after them, yielding each
+  # row as `read_data_row` does.
+  def read_all_data_rows(& : Array(Bytes?) -> Nil) : Nil | DBError
+    type = @stream.read_char!
+    while type == 'D'
+      read_data_row { |row| yield row }!
+      type = @stream.read_char!
+    end
+    expect_frame(Frame::CommandComplete, type)!
+    nil
+  end
+
+  # Whether a `CopyData` follows; at the end of the data the `CopyDone` is
+  # read.
+  def read_next_copy_start : Bool | DBError
+    type = @stream.read_char!
+
+    while type == 'N'
+      # NoticeResponse
+      frame = read_one_frame('N')!
+      handle_async_frames(frame)!
+      type = @stream.read_char!
+    end
+
+    if type == 'd'
+      true
+    else
+      expect_frame(Frame::CopyDone, type)!
+      false
+    end
+  end
+
+  # ------------------------------------------------------------ startup
+
+  def startup(args : Array(String)) : Nil | DBError
+    len = args.reduce(0) { |acc, arg| acc + arg.bytesize + 1 }
+    @stream.write_i32(len + 8 + 1)
+    @stream.write_i32(0x30000)
+    args.each do |arg|
+      @stream.write(arg)
+      @stream.write_byte(0_u8)
+    end
+    @stream.write_byte(0_u8)
+    @stream.flush
+  end
+
+  # Starts the session: startup, authentication, and the parameters the
+  # server reports until it is ready for a query.
+  def connect(replication : String? = nil) : Nil | DBError
+    startup_args = [
+      "user", @conninfo.user,
+      "database", @conninfo.database,
+      "application_name", @conninfo.application_name,
+      "client_encoding", "utf8",
+    ]
+    if replication
+      startup_args << "replication"
+      startup_args << replication
+    end
+
+    startup(startup_args)!
+
+    auth_frame = expect_frame(Frame::Authentication)!
+    handle_auth(auth_frame)!
+
+    while true
+      frame = read!
+      case frame
+      when Frame::BackendKeyData
+        # do nothing
+      when Frame::ReadyForQuery
+        break
+      else
+        return DBError.new("Expected BackendKeyData or ReadyForQuery but was #{frame}")
+      end
+    end
+
+    @established = true
+    nil
+  end
+
+  private def handle_auth(auth_frame : Frame::Authentication) : Nil | DBError
+    case auth_frame.type
+    when Frame::Authentication::Type::OK.value
+      # no op
+    when Frame::Authentication::Type::CleartextPassword.value
+      check_auth_method("cleartext")!
+      send_password_message(@conninfo.password)!
+      expect_frame(Frame::Authentication)!
+    when Frame::Authentication::Type::SASL.value
+      # the method is checked in the sasl handler
+      handle_auth_sasl(auth_frame.body_string)!
+    when Frame::Authentication::Type::MD5Password.value
+      check_auth_method("md5")!
+      salt = auth_frame.body_string
+      send_password_message(md5_password(@conninfo.user, @conninfo.password || "", salt))!
+      expect_frame(Frame::Authentication)!
+    else
+      return ConnectionError.new(
+        "unsupported authentication method: #{auth_type_name(auth_frame.type)}"
+      )
+    end
+    nil
+  end
+
+  private def auth_type_name(type : Int32) : String
+    found = Frame::Authentication::Type.from_value?(type)
+    found.nil? ? type.to_s : found.to_s
+  end
+
+  private def check_auth_method(method : String) : Nil | ConnectionError
+    unless @conninfo.auth_methods.includes?(method)
+      return ConnectionError.new(
+        "server asked for disabled authentication method: #{method}"
+      )
+    end
+    nil
+  end
+
+  private def handle_auth_sasl(mechanism_list : String) : Nil | DBError
+    mechs = mechanism_list.split('\0').reject(&.empty?)
+    unless mechs.includes?(SaslContext::SCRAM_NAME)
+      if mechs.includes?(SaslContext::SCRAM_PLUS_NAME)
+        return ConnectionError.new("the server offered only SCRAM-SHA-256-PLUS, which needs TLS")
+      end
+      return ConnectionError.new("no known sasl mechanism in list: #{mechs.join(", ")}")
+    end
+    check_auth_method("scram-sha-256")!
+
+    ctx = SaslContext.new(@conninfo.password || "")
+
+    # send client-first-message
+    @stream.write_char('p') # SASLInitialResponse
+    @stream.write_i32(4 + ctx.name.bytesize + 1 + 4 + ctx.client_first_msg.bytesize)
+    @stream.write(ctx.name)
+    @stream.write_byte(0_u8)
+    @stream.write_i32(ctx.client_first_msg.bytesize)
+    @stream.write(ctx.client_first_msg)
+    @stream.flush!
+
+    # receive server-first-message
+    continue = expect_frame(Frame::Authentication)!
+    final_msg = ctx.generate_client_final_message(continue.body_string)!
+
+    # send client-final-message
+    @stream.write_char('p')
+    @stream.write_i32(4 + final_msg.bytesize)
+    @stream.write(final_msg)
+    @stream.flush!
+
+    # receive server-final-message
+    final = expect_frame(Frame::Authentication)!
+    ctx.verify_server_signature(final.body_string)!
+    # receive OK
+    expect_frame(Frame::Authentication)!
+    nil
+  end
+
+  # ------------------------------------------------------------ queries
+
+  # Runs *query* with the simple query protocol: any number of statements,
+  # their rows ignored.
+  def simple_query(query : String) : Nil | DBError
+    send_query_message(query)!
+    while true
+      frame = read!
+      break if frame.is_a?(Frame::ReadyForQuery)
+    end
+    nil
+  end
+
+  def send_password_message(password : String?) : Nil | DBError
+    @stream.write_char('p')
+    if password
+      @stream.write_i32(password.bytesize + 4 + 1)
+      @stream.write(password)
+    else
+      @stream.write_i32(4 + 1)
+    end
+    @stream.write_byte(0_u8)
+    @stream.flush
+  end
+
+  def send_query_message(query : String) : Nil | DBError
+    @stream.write_char('Q')
+    @stream.write_i32(query.bytesize + 4 + 1)
+    @stream.write(query)
+    @stream.write_byte(0_u8)
+    @stream.flush
+  end
+
+  def send_parse_message(query : String) : Nil
+    @stream.write_char('P')
+    @stream.write_i32(query.bytesize + 4 + 1 + 2 + 1)
+    @stream.write_byte(0_u8) # prepared statment name
+    @stream.write(query)
+    @stream.write_byte(0_u8)
+    @stream.write_i16(0) # don't give any param types
+  end
+
+  # *result_format* 1 asks for binary results, which every decoder reads; 0
+  # asks for text.
+  def send_bind_message(params : Array(Param), result_format : Int32 = 1) : Nil
+    nparams = params.size
+    total_size = params.reduce(0) do |acc, p|
+      acc + 4 + (p.size == -1 ? 0 : p.size)
+    end
+
+    @stream.write_char('B')
+    @stream.write_i32(4 + 1 + 1 + 2 + (2 * nparams) + 2 + total_size + 2 + 2)
+    @stream.write_byte(0_u8)   # unnamed destination portal
+    @stream.write_byte(0_u8)   # unnamed prepared statment
+    @stream.write_i16(nparams) # number of params format codes to follow
+    params.each { |p| @stream.write_i16(p.format.to_i32) }
+    @stream.write_i16(nparams) # number of params to follow
+    params.each do |p|
+      @stream.write_i32(p.size)
+      @stream.write(p.slice) if p.size > 0
+    end
+    @stream.write_i16(1) # number of following return types (1 means apply next for all)
+    @stream.write_i16(result_format)
+  end
+
+  def send_describe_portal_message : Nil
+    @stream.write_char('D')
+    @stream.write_i32(4 + 1 + 1)
+    @stream.write_char('P')
+    @stream.write_byte(0_u8)
+  end
+
+  def send_execute_message : Nil
+    @stream.write_char('E')
+    @stream.write_i32(4 + 1 + 4)
+    @stream.write_byte(0_u8) # unnamed portal
+    @stream.write_i32(0)     # unlimited maximum rows
+  end
+
+  def send_sync_message : Nil | DBError
+    @stream.write_char('S')
+    @stream.write_i32(4)
+    @stream.flush
+  end
+
+  def send_terminate_message : Nil
+    @stream.write_char('X')
+    @stream.write_i32(4)
+  end
+
+  def send_copy_data_message(slice : Bytes) : Nil
+    @stream.write_char('d')
+    @stream.write_i32(4 + slice.size)
+    @stream.write(slice)
+  end
+
+  def send_copy_done_message : Nil | DBError
+    @stream.write_char('c')
+    @stream.write_i32(4)
+    @stream.flush
+  end
+end
