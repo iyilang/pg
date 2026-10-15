@@ -1,0 +1,92 @@
+# crystal-pg's spec/pq/pgpass_spec.cr.
+module pg/pq/pgpass_test
+
+import std/env
+import std/file
+import std/log::{Log, MemoryBackend, Severity}
+import db/db/spec::{describe, it}
+import pg/pq/conninfo::{ConnInfo}
+import pg/pq/pgpass::{LOG}
+import pg/testing/spec_helper::{env_var_bubble}
+
+def create_empty_pgpass_file(& : String -> Nil) : Nil
+  path = File.tempfile("pgpass")
+  defer File.delete(path)
+  File.chmod(path, 0o0600)
+  yield path
+end
+
+def create_valid_pgpass_file(& : String -> Nil) : Nil
+  create_empty_pgpass_file do |filename|
+    File.write(filename, "host:1:database:user:pass\n*:1:database:user:pass2\n*:*:database:user:pass3\n*:*:*:user:pass4\n*:*:*:*:pass5\n")
+    yield filename
+  end
+end
+
+def create_invalid_pgpass_file(& : String -> Nil) : Nil
+  create_empty_pgpass_file do |filename|
+    File.write(filename, "host:1:database:user")
+    yield filename
+  end
+end
+
+# crystal's `Log.capture("pg")`: the entries the "pg" logger writes while
+# the block runs.
+def capture_pg_log(& : -> Nil) : MemoryBackend
+  backend = MemoryBackend.new
+  previous = LOG.own_backend
+  LOG.backend = backend
+  defer LOG.backend = previous
+  yield
+  backend
+end
+
+def check_single_warning(backend : MemoryBackend, message : String) : Nil
+  warnings = backend.entries.select { |e| e.severity >= Severity::Warn }
+  assert warnings.size == 1, "warnings: #{warnings.map(&.message)}"
+  assert warnings[0].severity == Severity::Warn
+  assert warnings[0].message == message, warnings[0].message
+end
+
+def password_for(url : String) : String?
+  ConnInfo.from_conninfo_string(url).or_panic.password
+end
+
+describe "PQ::PgPass.parsing" do
+  it "parses a proper pgpass file" do
+    env_var_bubble do
+      create_valid_pgpass_file do |filename|
+        ENV["PGPASSFILE"] = filename
+        assert password_for("postgres://user@host:1/database") == "pass"
+        assert password_for("postgres://user@host2:1/database") == "pass2"
+        assert password_for("postgres://user@host2:2/database") == "pass3"
+        assert password_for("postgres://user@host2:2/database2") == "pass4"
+        assert password_for("postgres://user2@host:2/database2") == "pass5"
+      end
+    end
+  end
+
+  # pg/pq/pgpass skips the permission check on Windows, as libpq does.
+  {% unless flag?(:win32) %}
+    it "refuses to handle a pgpass file with improper permissions" do
+      env_var_bubble do
+        create_valid_pgpass_file do |filename|
+          File.chmod(filename, 0o0700)
+          ENV["PGPASSFILE"] = filename
+          backend = capture_pg_log { ConnInfo.from_conninfo_string("postgres://").or_panic; nil }
+          check_single_warning(backend, "Cannot use pgpass file - permissions are inappropriate must be 0600 or less")
+        end
+      end
+    end
+  {% end %}
+
+  it "gracefully handles an inproper pgpass file" do
+    env_var_bubble do
+      create_invalid_pgpass_file do |filename|
+        ENV["PGPASSFILE"] = filename
+        backend = capture_pg_log { ConnInfo.from_conninfo_string("postgres://").or_panic; nil }
+        check_single_warning(backend, "PGPass file does not appear to be properly formatted - errors may occur")
+      end
+    end
+  end
+end

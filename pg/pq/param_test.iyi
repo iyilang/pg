@@ -1,0 +1,35 @@
+# crystal-pg's spec/pq/param_spec.cr.
+module pg/pq/param_test
+
+import std/text
+import std/slice::{Bytes}
+import db/db/value::{DBValue}
+import db/db/spec::{describe, it}
+import pg/pq/param::{Param}
+# db/db/spec only type-checks with a driver loaded.
+import pg/core::{PGConnection}
+
+def it_encodes_array(name : String, value : Array(DBValue), encoded : String) : Nil
+  it "encodes #{name}" do
+    actual = Param.encode_array(value)
+    assert actual == encoded, "#{actual} != #{encoded}"
+  end
+end
+
+# Crystal's `String#to_slice`, which iyi's prelude lacks.
+def to_slice(s : String) : Bytes
+  Bytes.new(s.to_unsafe, s.bytesize, read_only: true)
+end
+
+describe "PQ::Param encoders #encode_array" do
+  it_encodes_array("Array(String) empty", [] of DBValue, "{}")
+  it_encodes_array("Array(Bool)", [true, false, true] of DBValue, "{t,f,t}")
+  it_encodes_array("Array(String)", ["t", "f", "t"] of DBValue, %({"t","f","t"}))
+  it_encodes_array("Array(Int32)", [1, 2, 3] of DBValue, "{1,2,3}")
+  it_encodes_array("Array(Float64)", [1.2, 3.4, 5.6] of DBValue, "{1.2,3.4,5.6}")
+  it_encodes_array("Array(String) escapes", [%(a), %(\\b~), %(c\\"d), %(\uFF8F)] of DBValue, %({"a","\\\\b~","c\\\\\\"d","\uFF8F"}))
+  it_encodes_array("Array(Bytes)", [to_slice(%(this is a "slice"))] of DBValue, %({"\\\\x7468697320697320612022736c69636522"}))
+  it_encodes_array("Array(String) comma", ["baz, bar"] of DBValue, %({"baz, bar"}))
+  it_encodes_array("Array(String) brace", ["foo}"] of DBValue, %({"foo}"}))
+  it_encodes_array("Array(Nil)", [nil, nil] of DBValue, %({NULL,NULL}))
+end

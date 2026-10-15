@@ -1,0 +1,29 @@
+# crystal-pg's spec/pq/connection_spec.cr.
+module pg/pq/connection_test
+
+import db/db/spec::{describe, it}
+import pg/core::{PGConnection}
+import pg/testing/spec_helper::*
+
+describe "PQ::Connection#server_parameters" do
+  it "ParameterStatus frames in response to set are handeled" do
+    with_connection do |conn|
+      get = -> { conn.connection.server_parameters["standard_conforming_strings"]? }
+      assert get.call == "on"
+      conn.exec("set standard_conforming_strings to on").or_panic
+      assert get.call == "on"
+      conn.exec("set standard_conforming_strings to off").or_panic
+      assert get.call == "off"
+      conn.exec("set standard_conforming_strings to default").or_panic
+      assert get.call == "on"
+    end
+  end
+end
+
+describe "PQ::Connection" do
+  it "handles empty queries" do
+    PG_DB.exec("").or_panic
+    PG_DB.query("") { |_| nil }.or_panic
+    assert PG_DB.query_one("select 1", as: Int32).or_panic == 1
+  end
+end

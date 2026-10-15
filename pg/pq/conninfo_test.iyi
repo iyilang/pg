@@ -1,0 +1,116 @@
+# crystal-pg's spec/pq/conninfo_spec.cr.
+module pg/pq/conninfo_test
+
+import std/env
+import db/db/errors::*
+import db/db/spec::{describe, it, expect_error}
+import pg/pq/conninfo::{ConnInfo}
+import pg/testing/spec_helper::{env_var_bubble}
+
+def assert_default_params(ci : ConnInfo) : Nil
+  assert (["/run/postgresql", "/tmp", "/var/run/postgresql"] + ["localhost"]).includes?(ci.host), "host #{ci.host}"
+  assert ci.database == ci.user, "database #{ci.database} user #{ci.user}"
+  assert ci.password.nil?, "password #{ci.password}"
+  assert ci.port == 5432
+  assert ci.sslmode == :prefer
+  assert ci.application_name == "crystal"
+end
+
+def assert_custom_params(ci : ConnInfo) : Nil
+  assert ci.host == "host"
+  assert ci.database == "db"
+  assert ci.user == "user"
+  assert ci.password == "pass"
+  assert ci.port == 5555
+  assert ci.sslmode == :require
+  assert ci.application_name == "specs"
+end
+
+def assert_ssl_params(ci : ConnInfo) : Nil
+  assert ci.sslmode == :"verify-full"
+  assert ci.sslcert == "postgresql.crt"
+  assert ci.sslkey == "postgresql.key"
+  assert ci.sslrootcert == "root.crt"
+end
+
+def parse(s : String) : ConnInfo
+  ConnInfo.from_conninfo_string(s).or_panic
+end
+
+describe "PQ::ConnInfo parts" do
+  it "can have all defaults" do
+    env_var_bubble do
+      assert_default_params ConnInfo.new
+    end
+  end
+
+  it "can take settings" do
+    assert_custom_params ConnInfo.new("host", "db", "user", "pass", 5555, :require, "specs")
+  end
+end
+
+describe "PQ::ConnInfo.from_conninfo_string" do
+  it "parses short postgres urls" do
+    env_var_bubble do
+      assert_default_params parse("postgres:///")
+    end
+  end
+
+  it "parses postgres urls" do
+    assert_custom_params parse("postgres://user:pass@host:5555/db?sslmode=require&otherparam=ignore&application_name=specs")
+    assert_ssl_params parse("postgres://user:pass@host:5555/db?sslmode=verify-full&sslcert=postgresql.crt&sslkey=postgresql.key&sslrootcert=root.crt")
+    assert_custom_params parse("postgresql://user:pass@host:5555/db?sslmode=require&application_name=specs")
+  end
+
+  it "parses postgres host from socket query string host" do
+    assert parse("postgresql://user:pass@/db?host=/sql/socket").host == "/sql/socket"
+  end
+
+  it "parses libpq style strings" do
+    assert_custom_params parse("host=host dbname=db user=user password=pass port=5555 sslmode=require application_name=specs")
+    assert_ssl_params parse("host=host dbname=db user=user password=pass port=5555 sslmode=verify-full sslcert=postgresql.crt sslkey=postgresql.key sslrootcert=root.crt")
+    assert parse("host=host").host == "host"
+    env_var_bubble do
+      assert_default_params parse("")
+    end
+    expect_error(ConnInfo.from_conninfo_string("hosthost"), ArgumentError)
+    nil
+  end
+
+  it "parses an IPv6 host" do
+    assert parse("postgres://user:pass@[::1]:5555/db").host == "::1"
+  end
+
+  it "auth_methods" do
+    assert parse("postgres://user:pass@localhost/foo").auth_methods == ["scram-sha-256-plus", "scram-sha-256", "md5"]
+    assert parse("postgres://user:pass@localhost/foo?auth_methods=md5").auth_methods == ["md5"]
+    assert parse("postgres://user:pass@localhost/foo?auth_methods=").auth_methods == [] of String
+    assert parse("postgres://user:pass@localhost/foo?auth_methods=cleartext,md5,scram-sha-256").auth_methods == ["cleartext", "md5", "scram-sha-256"]
+    expect_error(ConnInfo.from_conninfo_string("postgres://user:pass@localhost/foo?auth_methods=unsupported"), DBError)
+    expect_error(ConnInfo.from_conninfo_string("postgres://user:pass@localhost/foo?auth_methods=md5,unsupported"), DBError)
+    nil
+  end
+
+  it "uses environment variables" do
+    env_var_bubble do
+      ENV["PGDATABASE"] = "A"
+      ENV["PGHOST"] = "B"
+      ENV["PGPASSWORD"] = "C"
+      ENV["PGPORT"] = "1"
+      ENV["PGUSER"] = "D"
+      ENV["PGAPPNAME"] = "S"
+      ci = parse("postgres://")
+      assert ci.database == "A"
+      assert ci.host == "B"
+      assert ci.password == "C"
+      assert ci.port == 1
+      assert ci.user == "D"
+      assert ci.application_name == "S"
+    end
+
+    env_var_bubble do
+      ENV["PGHOST"] = "/path"
+      assert parse("postgres://").host == "/path"
+    end
+  end
+end

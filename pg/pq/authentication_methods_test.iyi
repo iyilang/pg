@@ -1,0 +1,178 @@
+# crystal-pg's spec/pq/authentication_methods_spec.cr, plus deterministic
+# checks of pg/pq/scram against published vectors.
+#
+# The local pg_hba.conf asks scram-sha-256 of everyone, so the nologin and
+# scram specs always run. The md5 and cleartext specs need pg_hba lines for
+# `crystal_md5` (md5) and `crystal_clear` (password); as crystal-pg gates
+# them on a `.run_auth_specs` file, they run here only when RUN_AUTH_SPECS
+# is set.
+module pg/pq/authentication_methods_test
+
+import std/env
+import std/int
+import std/text
+import db/db/db
+import db/db/errors::*
+import db/db/spec::{describe, it, expect_error}
+import pg/pq/scram::{SaslContext, hmac_sha256, pbkdf2_sha256, md5_password, bytes_string}
+import pg/core::{PGConnection}
+import pg/testing/spec_helper::*
+
+CURRENT_DATABASE = PG_DB.query_one("select current_database()", as: String).or_panic
+PORT             = ENV["PGPORT"]? || "5432"
+
+def role_url(role : String, pass : String, query : String = "") : String
+  "postgres://#{role}:#{pass}@127.0.0.1:#{PORT}/#{CURRENT_DATABASE}#{query}"
+end
+
+def test_role(role : String, pass : String) : Nil
+  ::Db::Db.open(role_url(role, pass)) do |db|
+    assert db.query_one("select 1", as: Int32).or_panic == 1
+  end.or_panic
+end
+
+# The cause of a refusal, which says why.
+def refusal_cause(result : ::Db::Core::Database | DBError) : String
+  error = expect_error(result, ConnectionRefused)
+  cause = error.cause
+  cause.nil? ? "" : cause.message
+end
+
+def create_role(name : String, encryption : String) : Nil
+  PG_DB.exec("drop role if exists #{name}").or_panic
+  PG_DB.using_connection do |conn|
+    conn.exec("set password_encryption='#{encryption}'").or_panic
+    conn.exec("create role #{name} login encrypted password 'pass'").or_panic
+    nil
+  end.or_panic
+end
+
+def hex(s : String) : String
+  String.build do |io|
+    s.bytes.each { |b| io << b.to_s(16).rjust(2, '0') }
+  end
+end
+
+describe "PQ::Connection nologin role" do
+  it "raises" do
+    PG_DB.exec("drop role if exists crystal_test").or_panic
+    PG_DB.exec("create role crystal_test nologin").or_panic
+    expect_error(::Db::Db.open("postgres://crystal_test@localhost"), ConnectionRefused)
+    PG_DB.exec("drop role if exists crystal_test").or_panic
+    nil
+  end
+end
+
+describe "PQ::Connection scram auth" do
+  it "works when given the correct password" do
+    create_role("crystal_scram", "scram-sha-256")
+    test_role("crystal_scram", "pass")
+    PG_DB.exec("drop role if exists crystal_scram").or_panic
+    nil
+  end
+
+  it "fails with a bad password" do
+    create_role("crystal_scram", "scram-sha-256")
+    expect_error(::Db::Db.open(role_url("crystal_scram", "wrong")), ConnectionRefused)
+    expect_error(::Db::Db.open(role_url("crystal_scram", "")), ConnectionRefused)
+    PG_DB.exec("drop role if exists crystal_scram").or_panic
+    nil
+  end
+
+  it "fails if auth_method is disabled" do
+    create_role("crystal_scram", "scram-sha-256")
+    cause = refusal_cause(::Db::Db.open("postgres://crystal_scram:pass@127.0.0.1:#{PORT}/?auth_methods=cleartext,md5"))
+    assert cause.includes?("server asked for disabled authentication method: scram-sha-256"), cause
+    cause = refusal_cause(::Db::Db.open(role_url("crystal_scram", "pass", "?auth_methods=md5")))
+    assert cause.includes?("server asked for disabled authentication method: scram-sha-256"), cause
+    PG_DB.exec("drop role if exists crystal_scram").or_panic
+    nil
+  end
+end
+
+if ENV["RUN_AUTH_SPECS"]?
+  describe "PQ::Connection md5 auth" do
+    it "works when given the correct password" do
+      create_role("crystal_md5", "md5")
+      test_role("crystal_md5", "pass")
+      PG_DB.exec("drop role if exists crystal_md5").or_panic
+      nil
+    end
+
+    it "fails when given the wrong password" do
+      create_role("crystal_md5", "md5")
+      expect_error(::Db::Db.open(role_url("crystal_md5", "bad")), ConnectionRefused)
+      expect_error(::Db::Db.open(role_url("crystal_md5", "")), ConnectionRefused)
+      PG_DB.exec("drop role if exists crystal_md5").or_panic
+      nil
+    end
+
+    it "fails if auth_method is disabled" do
+      create_role("crystal_md5", "md5")
+      cause = refusal_cause(::Db::Db.open("postgres://crystal_md5:pass@127.0.0.1:#{PORT}?auth_methods=cleartext,scram-sha-256"))
+      assert cause.includes?("server asked for disabled authentication method: md5"), cause
+      PG_DB.exec("drop role if exists crystal_md5").or_panic
+      nil
+    end
+  end
+
+  # "ssl clientcert auth" is omitted: iyi has no TLS (crystal-pg marks it pending too).
+
+  describe "PQ::Connection cleartext auth" do
+    it "fails by default" do
+      create_role("crystal_clear", "scram-sha-256")
+      cause = refusal_cause(::Db::Db.open("postgres://crystal_clear:pass@127.0.0.1:#{PORT}"))
+      assert cause.includes?("server asked for disabled authentication method: cleartext"), cause
+      cause = refusal_cause(::Db::Db.open("postgres://crystal_clear:pass@127.0.0.1:#{PORT}/?auth_methods=md5,scram-sha-256"))
+      assert cause.includes?("server asked for disabled authentication method: cleartext"), cause
+      PG_DB.exec("drop role if exists crystal_clear").or_panic
+      nil
+    end
+
+    it "works when auth_method is enabled" do
+      create_role("crystal_clear", "scram-sha-256")
+      ::Db::Db.open(role_url("crystal_clear", "pass", "?auth_methods=cleartext")) { |_| nil }.or_panic
+      ::Db::Db.open(role_url("crystal_clear", "pass", "?auth_methods=cleartext,md5,scram-sha-256")) { |_| nil }.or_panic
+      PG_DB.exec("drop role if exists crystal_clear").or_panic
+      nil
+    end
+  end
+end
+
+describe "PQ scram primitives" do
+  it "computes HMAC-SHA-256 (RFC 4231)" do
+    assert hex(hmac_sha256("Jefe", "what do ya want for nothing?")) == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    long_key = bytes_string(Array.new(131, 0xaa_u8))
+    assert hex(hmac_sha256(long_key, "Test Using Larger Than Block-Size Key - Hash Key First")) == "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+  end
+
+  it "computes PBKDF2-HMAC-SHA-256" do
+    assert hex(pbkdf2_sha256("password", "salt", 1)) == "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+    assert hex(pbkdf2_sha256("password", "salt", 4096)) == "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+  end
+
+  it "computes the md5 challenge answer" do
+    assert md5_password("user", "pass", "salt") == "md54950342e01923371fb6d34e764da880c"
+  end
+
+  # RFC 7677's example exchange (password "pencil"). PostgreSQL sends an
+  # empty `n=` user, which enters the AuthMessage, so the proof and server
+  # signature differ from the RFC's (computed independently for `n=`).
+  it "runs the RFC 7677 SCRAM-SHA-256 exchange as PostgreSQL does" do
+    ctx = SaslContext.new("pencil", "rOprNGfwEbeRWgbNEkqO")
+    assert ctx.name == "SCRAM-SHA-256"
+    assert ctx.client_first_msg == "n,,n=,r=rOprNGfwEbeRWgbNEkqO"
+    server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    final = ctx.generate_client_final_message(server_first)
+    assert final == "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=qvT2SWdEH5Q06albL+hjSYuUhCG7VndFyzIb7CK4n9k=", final.to_s
+    assert ctx.verify_server_signature("v=3HO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=").nil?
+    # The RFC's own signature belongs to user "user", not "".
+    assert ctx.verify_server_signature("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=").is_a?(DBError)
+  end
+
+  it "refuses a server nonce that does not extend the client's" do
+    ctx = SaslContext.new("pencil", "rOprNGfwEbeRWgbNEkqO")
+    assert ctx.generate_client_final_message("r=other,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096").is_a?(DBError)
+    assert ctx.verify_server_signature("v=anything").is_a?(DBError)
+  end
+end
