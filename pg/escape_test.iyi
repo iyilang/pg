@@ -1,0 +1,44 @@
+# crystal-pg's spec/pg/escape_helper_spec.cr.
+module pg/escape_test
+
+import std/slice::{Bytes}
+import db/db/spec::{describe, it}
+import pg/core::{PGConnection}
+import pg/testing/spec_helper::*
+
+def escape_literal_bytes(s : String) : String
+  result = ""
+  with_connection { |conn| result = conn.escape_literal(Bytes.new(s.to_unsafe, s.bytesize, read_only: true)) }
+  result
+end
+
+describe "PG::Connection#escape_literal" do
+  it "quotes plain text" do
+    assert escape_literal(%(foo)) == %('foo')
+  end
+
+  it "uses E'' for backslashes" do
+    assert escape_literal(%(this has a \\)) == %( E'this has a \\\\')
+  end
+
+  it "doubles single quotes" do
+    assert escape_literal(%(what's your "name")) == %('what''s your "name"')
+  end
+
+  it "hex-encodes bytes" do
+    assert escape_literal_bytes(%(foo)) == %('\\x666f6f')
+  end
+  # crystal-pg leaves "raises on invalid strings" commented out: iyi Strings
+  # are valid UTF-8, so there is nothing to raise on.
+end
+
+describe "PG::Connection#escape_identifier" do
+  it "quotes plain text" do
+    assert escape_identifier(%(foo)) == %("foo")
+  end
+
+  it "doubles double quotes and keeps backslashes" do
+    assert escape_identifier(%(what's \\ your "name")) == %("what's \\ your ""name""")
+  end
+  # "raises on invalid strings" is commented out in crystal-pg as well.
+end

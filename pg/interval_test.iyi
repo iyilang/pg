@@ -1,0 +1,71 @@
+# crystal-pg's spec/pg/interval_spec.cr. `MonthSpan` stands in for
+# Crystal's `Time::MonthSpan`, and `to_span` answers a `DBError` where
+# crystal-pg raises.
+module pg/interval_test
+
+import std/int
+import std/time::{Span}
+import db/db/errors::*
+import db/db/spec::{describe, it, expect_error}
+import pg/interval::{Interval, MonthSpan}
+# db/db/spec only type-checks with a driver loaded.
+import pg/core::{PGConnection}
+
+def span_of(interval : Interval, approx_months : Int32? = nil) : Span
+  interval.to_span(approx_months).or_panic
+end
+
+describe "PG::Interval" do
+  describe "empty interval" do
+    it "converts to empty Span" do
+      assert span_of(Interval.new) == Span.new
+    end
+
+    it "converts to empty MonthSpan" do
+      assert Interval.new.to_month_span == MonthSpan.new(0)
+    end
+  end
+
+  describe "overflowing for Span" do
+    it "answers an error when overflowing" do
+      expect_error(Interval.new(months: -1).to_span, DBError)
+      expect_error(Interval.new(months: 1).to_span, DBError)
+      nil
+    end
+
+    it "allows to ignore overflow" do
+      span = span_of(Interval.new(microseconds: 123_000_000_i64, months: 2), 30)
+      assert span == Span.new(days: 60, seconds: 123), span.to_s
+    end
+  end
+
+  describe "to_span" do
+    it "adds days to days contained in microseconds" do
+      # 13.17:23:26.535897
+      interval = Interval.new(microseconds: 149_006_535_897_i64, days: 12)
+      span = span_of(interval)
+      assert span == Span.new(days: 13, hours: 17, seconds: 1406, nanoseconds: 535_897_000), span.to_s
+    end
+
+    it "maximum values can be covered by Span" do
+      # MAX = 9_223_372_036_854_775_807
+      interval = Interval.new(microseconds: 9223372036854775807_i64, days: 2147483647)
+      span = span_of(interval)
+      assert span == Span.new(days: 2147483647_i64, seconds: 9223372036854_i64, nanoseconds: 775_807_000), span.to_s
+    end
+
+    it "minimum values can be covered by Span" do
+      # MIN = -9_223_372_036_854_775_808
+      interval = Interval.new(microseconds: (-9223372036854775807_i64 - 1), days: -2147483648)
+      span = span_of(interval)
+      assert span == Span.new(days: -2147483648_i64, seconds: -9223372036854_i64, nanoseconds: -775_808_000), span.to_s
+    end
+  end
+
+  describe "to_month_span" do
+    it "does not add days to months" do
+      interval = Interval.new(months: 123, days: 45)
+      assert interval.to_month_span == MonthSpan.new(123)
+    end
+  end
+end
