@@ -1,0 +1,248 @@
+# crystal-pg's spec/pg/driver_spec.cr.
+module pg/driver_test
+
+import std/int
+import std/text
+import std/json::{JSON, Any}
+import db/db/db
+import db/db/errors::*
+import db/db/value::{DBValue}
+import db/db/core::{ResultSet, Transaction}
+import db/db/serializable::{db_serializable}
+import db/db/spec::{describe, it, expect_error}
+import pg/pq/errors::{PQError}
+import pg/core::{PGDriver}
+import pg/testing/spec_helper::*
+
+def assert_single_read(rs : ResultSet, value_type : T.class, value : V) : Nil forall T, V
+  assert rs.move_next.or_panic
+  assert rs.read(value_type).or_panic == value
+  assert !rs.move_next.or_panic
+end
+
+class StructWithMapping
+  property a : Int32
+  property b : Int32
+
+  derive db_serializable
+end
+
+def count_person(tx : Transaction) : DBValue
+  tx.connection.scalar("select count(*) from person").or_panic
+end
+
+describe "PG::Driver" do
+  # by name: iyi's `Class` has no `==`
+  it "should register postgres name" do
+    assert ::Db::Db.driver_class("postgres").or_panic.to_s == PGDriver.to_s
+  end
+
+  it "exectes and selects value" do
+    PG_DB.query "select 123::int4" do |rs|
+      assert_single_read rs, Int32, 123
+    end.or_panic
+  end
+
+  it "gets column count" do
+    PG_DB.query "select 1::int4, 1::int4" do |rs|
+      assert rs.column_count == 2
+    end.or_panic
+  end
+
+  it "gets column names" do
+    PG_DB.query "select 1::int4 as foo, 1::int4 as bar" do |rs|
+      assert rs.column_name(0) == "foo"
+      assert rs.column_name(1) == "bar"
+    end.or_panic
+  end
+
+  it "should raise an exception if unique constraint is violated" do
+    PG_DB.exec("drop table if exists contacts").or_panic
+    PG_DB.exec("create table contacts (name varchar(256), CONSTRAINT key_name UNIQUE(name))").or_panic
+
+    PG_DB.query("insert into contacts values ($1)", "Foo") { |rs| rs.move_next }.or_panic
+    result = PG_DB.query "insert into contacts values ($1)", "Foo" do |rs|
+      rs.move_next
+    end
+    expect_error(result, PQError)
+    nil
+  end
+
+  it "executes insert" do
+    PG_DB.exec("drop table if exists contacts").or_panic
+    PG_DB.exec("create table contacts (name varchar(256), age int4)").or_panic
+
+    result = PG_DB.exec("insert into contacts values ($1, $2)", "Foo", 10).or_panic
+
+    assert result.last_insert_id == 0 # postgres doesn't support this
+    assert result.rows_affected == 1
+  end
+
+  it "executes insert via query" do
+    PG_DB.query("drop table if exists contacts") do |rs|
+      assert !rs.move_next.or_panic
+    end.or_panic
+  end
+
+  it "executes update" do
+    PG_DB.exec("drop table if exists contacts").or_panic
+    PG_DB.exec("create table contacts (name varchar(256), age int4)").or_panic
+
+    PG_DB.exec("insert into contacts values ($1, $2)", "Foo", 10).or_panic
+    PG_DB.exec("insert into contacts values ($1, $2)", "Baz", 10).or_panic
+    PG_DB.exec("insert into contacts values ($1, $2)", "Baz", 20).or_panic
+
+    result = PG_DB.exec("update contacts set age = 30 where age = 10").or_panic
+
+    assert result.last_insert_id == 0 # postgres doesn't support this
+    assert result.rows_affected == 2
+  end
+
+  it "traverses result set" do
+    PG_DB.exec("drop table if exists contacts").or_panic
+    PG_DB.exec("create table contacts (name varchar(256), age int4)").or_panic
+
+    PG_DB.exec("insert into contacts values ($1, $2)", "Foo", 10).or_panic
+    PG_DB.exec("insert into contacts values ($1, $2)", "Bar", 20).or_panic
+
+    PG_DB.query "select name, age from contacts order by age" do |rs|
+      assert rs.move_next.or_panic
+      assert rs.read(String).or_panic == "Foo"
+      assert rs.move_next.or_panic
+      assert rs.read(String).or_panic == "Bar"
+      assert !rs.move_next.or_panic
+    end.or_panic
+  end
+
+  it "treats Slice(UInt8) as String" do
+    with_db do |db|
+      db.exec("create extension if not exists citext with schema public").or_panic
+      db.exec("drop table if exists users").or_panic
+      db.exec("create table users (email citext)").or_panic
+      db.exec("insert into users values ($1)", "foo@example.com").or_panic
+
+      db.query "select email from users limit 1" do |rs|
+        assert_single_read rs, String, "foo@example.com"
+      end.or_panic
+
+      db.query "select email from users limit 1" do |rs|
+        assert_single_read rs, String | Nil, "foo@example.com"
+      end.or_panic
+    end
+  end
+
+  it "converts json result into JSON::Any if requested" do
+    with_db do |db|
+      db.exec("drop table if exists users").or_panic
+      db.exec("create table users (properties jsonb)").or_panic
+      db.exec("insert into users values ($1)", "{\"hello\": \"world\"}").or_panic
+
+      db.query "select properties from users limit 1" do |rs|
+        assert_single_read rs, Any, JSON.parse("{\"hello\": \"world\"}")
+      end.or_panic
+    end
+  end
+
+  describe "transactions" do
+    it "can read inside transaction and rollback after" do
+      with_db do |db|
+        db.exec("drop table if exists person").or_panic
+        db.exec("create table person (name varchar(25))").or_panic
+        db.transaction do |tx|
+          assert count_person(tx) == 0_i64
+          tx.connection.exec("insert into person (name) values ($1)", "John Doe").or_panic
+          assert count_person(tx) == 1_i64
+          tx.rollback
+        end.or_panic
+        assert db.scalar("select count(*) from person").or_panic == 0_i64
+      end
+    end
+
+    it "can read inside transaction or after commit" do
+      with_db do |db|
+        db.exec("drop table if exists person").or_panic
+        db.exec("create table person (name varchar(25))").or_panic
+        db.transaction do |tx|
+          assert count_person(tx) == 0_i64
+          tx.connection.exec("insert into person (name) values ($1)", "John Doe").or_panic
+          assert count_person(tx) == 1_i64
+          # using other connection
+          assert db.scalar("select count(*) from person").or_panic == 0_i64
+        end.or_panic
+        assert db.scalar("select count(*) from person").or_panic == 1_i64
+      end
+    end
+  end
+
+  describe "nested transactions" do
+    it "can read inside transaction and rollback after" do
+      with_db do |db|
+        db.exec("drop table if exists person").or_panic
+        db.exec("create table person (name varchar(25))").or_panic
+        db.transaction do |tx_0|
+          assert count_person(tx_0) == 0_i64
+          tx_0.connection.exec("insert into person (name) values ($1)", "John Doe").or_panic
+          tx_0.transaction do |tx_1|
+            tx_1.connection.exec("insert into person (name) values ($1)", "Sarah").or_panic
+            assert count_person(tx_1) == 2_i64
+            tx_1.transaction do |tx_2|
+              tx_2.connection.exec("insert into person (name) values ($1)", "Jimmy").or_panic
+              assert count_person(tx_2) == 3_i64
+              tx_2.rollback
+            end.or_panic
+          end.or_panic
+          assert count_person(tx_0) == 2_i64
+          tx_0.rollback
+        end.or_panic
+        assert db.scalar("select count(*) from person").or_panic == 0_i64
+      end
+    end
+  end
+
+  describe "move_next" do
+    it "properly skips null columns" do
+      no_nulls = StructWithMapping.from_rs(PG_DB.query("select 1 as a, 1 as b").or_panic).or_panic.first
+      assert({no_nulls.a, no_nulls.b} == {1, 1})
+
+      expect_error(StructWithMapping.from_rs(PG_DB.query("select 2 as a, null as b").or_panic),
+        MappingError, "the column b returned a Nil but a Int32 was expected.", partial: true)
+
+      # importantly not an IndexError: Index out of bounds
+      expect_error(StructWithMapping.from_rs(PG_DB.query("select null as a, null as b").or_panic),
+        MappingError, "the column a returned a Nil but a Int32 was expected.", partial: true)
+      nil
+    end
+  end
+
+  describe "close" do
+    it "skips unread rows before releasing the connection" do
+      db = ::Db::Db.open("#{DB_URL}#{DB_URL.includes?("?") ? '&' : '?'}max_pool_size=1").or_panic
+      defer db.close
+      row_read = Channel(Nil).new
+      closed = false
+      checked_out_before_close = Channel(Bool).new
+
+      group do |g|
+        # Waits for the only connection while the result set below is closed
+        g.spawn do
+          row_read.receive
+          db.using_connection { |_| checked_out_before_close.send(!closed) }.or_panic
+          0
+        end
+
+        # The remaining rows are larger than the server's send buffer and
+        # produced slowly, so skipping them has to wait on the socket
+        db.query("select repeat('x', 10000), pg_sleep(0.01) from generate_series(1, 50)") do |rs|
+          if rs.move_next.or_panic
+            rs.read(String).or_panic
+            row_read.send(nil)
+            sleep 0 # crystal's `Fiber.yield`
+          end
+        end.or_panic
+        closed = true
+
+        assert checked_out_before_close.receive == false
+      end
+    end
+  end
+end

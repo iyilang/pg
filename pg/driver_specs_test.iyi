@@ -1,0 +1,95 @@
+# crystal-pg's spec/db_spec.cr: crystal-db's shared driver specs
+# (`DriverSpecs`) run against PostgreSQL.
+#
+# crystal-pg reopened `DB::DriverSpecs#with_db` to run every example on
+# `PG_DB` instead of a database of its own. iyi cannot reopen a class of
+# another package, so each example opens its own database from
+# `DATABASE_URL`, as `DriverSpecs#with_db` does, dropping table1, table2
+# and person first.
+module pg/driver_specs_test
+
+import std/int
+import std/float
+import std/time::{Time}
+import std/slice::{Slice, Bytes}
+import db/db/spec::{DriverSpecs}
+import pg/testing/spec_helper::{DB_URL}
+
+def cast(expr : String, sql_type : String?) : String
+  if t = sql_type
+    "#{expr}::#{t}"
+  else
+    expr
+  end
+end
+
+def bytes(values : Array(Int32)) : Bytes
+  slice = Bytes.new(values.size)
+  values.each_with_index { |v, i| slice[i] = v.to_u8 }
+  slice
+end
+
+def null_text(null : Bool) : String
+  null ? "NULL" : "NOT NULL"
+end
+
+DriverSpecs.run do |specs|
+  specs.connection_string DB_URL
+
+  specs.sample_value true, "boolean", "true"
+  specs.sample_value false, "boolean", "false"
+  specs.sample_value 2, "int4", "2::int4"
+  specs.sample_value 1_i64, "int8", "1::int8"
+  specs.sample_value "hello", "varchar(256)", "'hello'::varchar"
+  specs.sample_value 1.5_f32, "float4", "1.5::float4"
+  specs.sample_value 1.5, "float", "1.5::float"
+
+  specs.sample_value Time.utc(2015, 2, 3, 17, 15, 13), "timestamptz", "'2015-02-03 16:15:13-01'::timestamptz"
+  specs.sample_value Time.utc(2015, 2, 3, 17, 15, 14, nanosecond: 230_000_000), "timestamptz(3)", "'2015-02-03 16:15:14.23-01'::timestamptz"
+  specs.sample_value Time.utc(2015, 2, 3, 16, 15, 15), "timestamp", "'2015-02-03 16:15:15'::timestamp"
+  specs.sample_value Time.utc(2015, 2, 3, 0, 0, 0), "date", "'2015-02-03'::date"
+
+  specs.sample_value bytes([0o001, 0o134, 0o176]), "bytea", "E'\\\\001\\\\134\\\\176'::bytea"
+  specs.sample_value bytes([5, 0, 255, 128]), "bytea", "E'\\\\005\\\\000\\\\377\\\\200'::bytea"
+  specs.sample_value Bytes.empty, "bytea", "E''::bytea"
+
+  specs.binding_syntax do |index|
+    "$#{index}"
+  end
+
+  specs.create_table_1column_syntax do |table_name, col1|
+    "create table #{table_name} (#{col1.name} #{col1.sql_type} #{null_text(col1.null)})"
+  end
+
+  specs.create_table_2columns_syntax do |table_name, col1, col2|
+    "create table #{table_name} (#{col1.name} #{col1.sql_type} #{null_text(col1.null)}, #{col2.name} #{col2.sql_type} #{null_text(col2.null)})"
+  end
+
+  specs.select_1column_syntax do |table_name, col1|
+    "select #{cast(col1.name, col1.sql_type)} from #{table_name}"
+  end
+
+  specs.select_2columns_syntax do |table_name, col1, col2|
+    "select #{cast(col1.name, col1.sql_type)}, #{cast(col2.name, col2.sql_type)} from #{table_name}"
+  end
+
+  specs.select_count_syntax do |table_name|
+    "select count(*) from #{table_name}"
+  end
+
+  specs.select_scalar_syntax do |expression, sql_type|
+    "select #{cast(expression, sql_type)}"
+  end
+
+  specs.insert_1column_syntax do |table_name, col, expression|
+    "insert into #{table_name} (#{col.name}) values (#{expression})"
+  end
+
+  specs.insert_2columns_syntax do |table_name, col1, expr1, col2, expr2|
+    "insert into #{table_name} (#{col1.name}, #{col2.name}) values (#{expr1}, #{expr2})"
+  end
+
+  specs.drop_table_if_exists_syntax do |table_name|
+    "drop table if exists #{table_name}"
+  end
+end
