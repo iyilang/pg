@@ -1,0 +1,86 @@
+# Quoting identifiers and literals for SQL text, as libpq's
+# `PQescapeIdentifier` and `PQescapeLiteral` do. `PGConnection` has these
+# methods.
+module pg/escape
+
+import std/slice::{Slice, Bytes}
+
+pub trait EscapeHelper
+  # `#escape_identifier` escapes a string for use as an SQL identifier, such
+  # as a table, column, or function name. This is useful when a user-supplied
+  # identifier might contain special characters that would otherwise not be
+  # interpreted as part of the identifier by the SQL parser, or when the
+  # identifier might contain upper case characters whose case should be
+  # preserved.
+  def escape_identifier(str : String) : String
+    Escaping.escape(str, true)
+  end
+
+  # `#escape_literal` escapes a string for use within an SQL command. This is
+  # useful when inserting data values as literal constants in SQL commands.
+  # Certain characters (such as quotes and backslashes) must be escaped to
+  # prevent them from being interpreted specially by the SQL parser.
+  # PQescapeLiteral performs this operation.
+  #
+  # Note that it is not necessary nor correct to do escaping when a data
+  # value is passed as a separate parameter in `#exec`
+  def escape_literal(str : String) : String
+    Escaping.escape(str, false)
+  end
+
+  # `#escape_literal` escapes binary data suitable for use with the BYTEA type.
+  def escape_literal(slice : Bytes) : String
+    Escaping.escape_bytes(slice)
+  end
+end
+
+# The quoting itself. A struct of class methods rather than module
+# functions, so the trait's bodies name it relative to this module, which
+# holds whatever namespace a consumer's short name gives the package.
+pub struct Escaping
+  # A reimplementation of `PQescapeInternal`.
+  # todo this should take into account server encoding if not utf8
+  def self.escape(str : String, as_ident : Bool) : String
+    num_quotes = 0
+    num_backslashes = 0
+    quote_char = as_ident ? '"' : '\''
+
+    # scan the string for characters that must be escaped
+    str.each_char do |char|
+      if char == '\\'
+        num_backslashes += 1
+      elsif char == quote_char
+        num_quotes += 1
+      end
+    end
+
+    literal_with_backslashes = !as_ident && num_backslashes > 0
+
+    String.build(str.bytesize + num_quotes + num_backslashes + 4) do |build|
+      if literal_with_backslashes
+        build << ' ' << 'E'
+      end
+      build << quote_char
+
+      if num_backslashes == 0 && num_quotes == 0
+        build << str
+      else
+        str.each_char do |c|
+          if c == quote_char
+            build << quote_char
+          elsif c == '\\'
+            build << '\\' unless as_ident
+          end
+          build << c
+        end
+      end
+
+      build << quote_char
+    end
+  end
+
+  # A `bytea` literal: `'\x...'`.
+  def self.escape_bytes(slice : Bytes) : String
+    "'\\x#{slice.hexstring}'"
+  end
+end
