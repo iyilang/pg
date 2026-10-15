@@ -1,0 +1,364 @@
+# The backend messages of the PostgreSQL wire protocol, parsed from the bytes
+# of one message, and the values they carry to a program: `Field`,
+# `Notice`, `Notification`.
+#
+# https://www.postgresql.org/docs/current/protocol-message-formats.html
+module pg/pq/frame
+
+import std/int
+import std/text
+import std/slice::{Slice, Bytes}
+import pg/pq/errors::{ErrorField}
+
+# One column of a `RowDescription`.
+pub class Field
+  getter name : String
+  getter col_oid : Int32
+  getter table_oid : Int16
+  getter type_oid : Int32
+  getter type_size : Int16
+  getter type_modifier : Int32
+  getter format : Int16
+
+  def initialize(@name : String, @col_oid : Int32, @table_oid : Int16,
+                 @type_oid : Int32, @type_size : Int16, @type_modifier : Int32,
+                 @format : Int16)
+  end
+end
+
+# A `NOTIFY` delivered to a connection that `LISTEN`s.
+pub struct Notification
+  getter pid : Int32
+  getter channel : String
+  getter payload : String
+
+  def initialize(@pid : Int32, @channel : String, @payload : String)
+  end
+end
+
+# A notice or an error the server sent, by its fields.
+#
+# http://www.postgresql.org/docs/current/static/protocol-error-fields.html
+pub struct Notice
+  getter fields : Array(ErrorField)
+  getter severity : String
+  getter code : String
+  getter message : String
+
+  def initialize(@fields : Array(ErrorField))
+    severity = ""
+    code = ""
+    message = ""
+
+    fields.each do |f|
+      case f.name
+      when :severity
+        severity = f.message
+      when :code
+        code = f.message
+      when :message
+        message = f.message
+      else
+        # ignore
+      end
+    end
+
+    @severity = severity
+    @code = code
+    @message = message
+  end
+
+  def to_s : String
+    "#{severity}:  #{message}\n"
+  end
+end
+
+# A backend message, parsed from its type byte and its body.
+pub abstract class Frame
+  def self.new(type : Char, bytes : Bytes) : Frame
+    case type
+    when 'C' then CommandComplete.new(bytes)
+    when 'Z' then ReadyForQuery.new(bytes)
+    when '1' then ParseComplete.new(bytes)
+    when '2' then BindComplete.new(bytes)
+    when 'T' then RowDescription.new(bytes)
+    when 'A' then NotificationResponse.new(bytes)
+    when 'E' then ErrorResponse.new(bytes)
+    when 'N' then NoticeResponse.new(bytes)
+    when 'n' then NoData.new(bytes)
+    when 'I' then EmptyQueryResponse.new(bytes)
+    when 'S' then ParameterStatus.new(bytes)
+    when 'K' then BackendKeyData.new(bytes)
+    when 'R' then Authentication.new(bytes)
+    when 'c' then CopyDone.new(bytes)
+    when 'G' then CopyInResponse.new(bytes)
+    when 'H' then CopyOutResponse.new(bytes)
+    when 'W' then CopyBothResponse.new(bytes)
+    else          Unknown.new(type, bytes)
+    end
+  end
+
+  def initialize(bytes : Bytes)
+  end
+
+  def to_s : String
+    self.class.to_s
+  end
+
+  # The NUL-terminated string at *pos*, and the position after it.
+  protected def find_next_string(pos : Int32, bytes : Bytes) : Tuple(Int32, String)
+    start = pos
+    while pos < bytes.size && bytes[pos] != 0_u8
+      pos += 1
+    end
+    {pos + 1, Frame.string_of(bytes, start, pos - start)}
+  end
+
+  protected def i32(pos : Int32, bytes : Bytes) : Tuple(Int32, Int32)
+    {pos + 4, (bytes[pos + 3].to_i32) |
+      (bytes[pos + 2].to_i32 << 8) |
+      (bytes[pos + 1].to_i32 << 16) |
+      (bytes[pos].to_i32 << 24)}
+  end
+
+  protected def i16(pos : Int32, bytes : Bytes) : Tuple(Int32, Int16)
+    v = (bytes[pos].to_i32 << 8) | bytes[pos + 1].to_i32
+    {pos + 2, (v >= 32768 ? v - 65536 : v).to_i16}
+  end
+
+  # *count* bytes of *bytes* from *start*, as a string.
+  def self.string_of(bytes : Bytes, start : Int32, count : Int32) : String
+    String.new(count) do |buffer|
+      buffer.copy_from(bytes.to_unsafe + start, count)
+    end
+  end
+
+  # A message this library does not know.
+  class Unknown < Frame
+    getter type : Char
+    getter bytes : Bytes
+
+    def initialize(@type : Char, @bytes : Bytes)
+    end
+
+    def to_s : String
+      "PQ::Frame::Unknown(#{@type.inspect})"
+    end
+  end
+
+  class Authentication < Frame
+    enum Type : Int32
+      OK                =  0
+      KerberosV5        =  2
+      CleartextPassword =  3
+      MD5Password       =  5
+      SCMCredential     =  6
+      GSS               =  7
+      GSSContinue       =  8
+      SSPI              =  9
+      SASL              = 10
+      SASLContinue      = 11
+      SASLFinal         = 12
+    end
+
+    getter type : Int32
+    getter body : Bytes
+
+    def initialize(bytes : Bytes)
+      pos, t = i32(0, bytes)
+      @type = t
+      @body = bytes + pos
+    end
+
+    def body_string : String
+      Frame.string_of(@body, 0, @body.size)
+    end
+  end
+
+  class ParameterStatus < Frame
+    getter key : String
+    getter value : String
+
+    def initialize(bytes : Bytes)
+      pos, key = find_next_string(0, bytes)
+      @key = key
+      @value = Frame.string_of(bytes, pos, bytes.size - pos - 1)
+    end
+  end
+
+  class BackendKeyData < Frame
+    getter pid : Int32
+    getter secret : Int32
+
+    def initialize(bytes : Bytes)
+      pos, pid = i32(0, bytes)
+      pos, secret = i32(pos, bytes)
+      @pid = pid
+      @secret = secret
+    end
+  end
+
+  class ReadyForQuery < Frame
+    # `'I'` idle, `'T'` in a transaction, `'E'` in a failed transaction.
+    getter transaction_status : Char
+
+    def initialize(bytes : Bytes)
+      @transaction_status = bytes[0].unsafe_chr
+    end
+  end
+
+  # An `ErrorResponse` or a `NoticeResponse`: fields by their code bytes.
+  abstract class ErrorNoticeFrame < Frame
+    getter fields : Array(ErrorField)
+
+    def initialize(bytes : Bytes)
+      @fields = [] of ErrorField
+      pos = 0
+      while pos < bytes.size
+        code = bytes[pos]
+        break if code == 0_u8
+        pos += 1
+        pos, message = find_next_string(pos, bytes)
+        @fields << ErrorField.new(ErrorNoticeFrame.name_from_code(code), message, code)
+      end
+    end
+
+    def as_notice : Notice
+      Notice.new(fields)
+    end
+
+    # https://www.postgresql.org/docs/current/protocol-error-fields.html
+    def self.name_from_code(code : UInt8) : Symbol
+      case code.unsafe_chr
+      when 'S' then :severity
+      when 'V' then :severity_unlocalized
+      when 'C' then :code
+      when 'M' then :message
+      when 'D' then :detail
+      when 'H' then :hint
+      when 'P' then :position
+      when 'p' then :internal_position
+      when 'q' then :internal_query
+      when 'W' then :where
+      when 's' then :schema_name
+      when 't' then :table_name
+      when 'c' then :column_name
+      when 'd' then :datatype_name
+      when 'n' then :constraint_name
+      when 'F' then :file
+      when 'L' then :line
+      when 'R' then :routine
+      else          :unknown
+      end
+    end
+  end
+
+  class NotificationResponse < Frame
+    getter pid : Int32
+    getter channel : String
+    getter payload : String
+
+    def initialize(bytes : Bytes)
+      pos, pid = i32(0, bytes)
+      pos, channel = find_next_string(pos, bytes)
+      pos, payload = find_next_string(pos, bytes)
+      @pid = pid
+      @channel = channel
+      @payload = payload
+    end
+
+    def as_notification : Notification
+      Notification.new(pid, channel, payload)
+    end
+  end
+
+  class ErrorResponse < ErrorNoticeFrame
+    def initialize(bytes : Bytes)
+      super(bytes)
+    end
+  end
+
+  class NoticeResponse < ErrorNoticeFrame
+    def initialize(bytes : Bytes)
+      super(bytes)
+    end
+  end
+
+  class RowDescription < Frame
+    getter nfields : Int16
+    getter fields : Array(Field)
+
+    def initialize(bytes : Bytes)
+      pos, nfields = i16(0, bytes)
+      @nfields = nfields
+      @fields = [] of Field
+      nfields.to_i32.times do
+        pos, name = find_next_string(pos, bytes)
+        pos, col_oid = i32(pos, bytes)
+        pos, table_oid = i16(pos, bytes)
+        pos, type_oid = i32(pos, bytes)
+        pos, type_size = i16(pos, bytes)
+        pos, type_modifier = i32(pos, bytes)
+        pos, format = i16(pos, bytes)
+        @fields << Field.new(name, col_oid, table_oid, type_oid, type_size, type_modifier, format)
+      end
+    end
+  end
+
+  class NoData < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  class CommandComplete < Frame
+    getter bytes : Bytes
+
+    def initialize(@bytes : Bytes)
+    end
+
+    # The command tag: `INSERT 0 1`, `SELECT 3`, ...
+    def command : String
+      Frame.string_of(@bytes, 0, @bytes.size - 1)
+    end
+
+    def rows_affected : Int64
+      last = command.split.last?
+      (last && last.to_i64?) || 0_i64
+    end
+  end
+
+  class ParseComplete < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  class BindComplete < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  class EmptyQueryResponse < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  class CopyDone < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  class CopyInResponse < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  class CopyOutResponse < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  class CopyBothResponse < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+end

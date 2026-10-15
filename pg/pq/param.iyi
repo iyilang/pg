@@ -1,0 +1,130 @@
+# A bound argument as the `Bind` message carries it: bytes, their size (-1
+# for NULL), and the format, 0 for text and 1 for binary.
+module pg/pq/param
+
+import std/int
+import std/float
+import std/text
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import db/db/value::{DBValue, CustomValue}
+import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
+import pg/interval::{Interval}
+
+pub struct Param
+  getter slice : Bytes
+  getter size : Int32
+  getter format : Int16
+  # The string *slice* points into, held so it lives as long as the param.
+  @text : String?
+
+  def initialize(@slice : Bytes, @size : Int32, @format : Int16, @text : String? = nil)
+  end
+
+  #  Internal wrapper to represent an encoded parameter
+  def self.encode(val : DBValue) : Param
+    case val
+    when Nil
+      binary(Bytes.empty, -1)
+    when Bytes
+      binary(val, val.size)
+    when Array
+      text(encode_array(val))
+    when Time
+      text(val.to_rfc3339(9))
+    when Point
+      text("(#{val.x},#{val.y})")
+    when Line
+      text("{#{val.a},#{val.b},#{val.c}}")
+    when Circle
+      text("<(#{val.x},#{val.y}),#{val.radius}>")
+    when LineSegment
+      text("((#{val.x1},#{val.y1}),(#{val.x2},#{val.y2}))")
+    when Box
+      text("((#{val.x1},#{val.y1}),(#{val.x2},#{val.y2}))")
+    when Path
+      if val.closed?
+        encode_points("(", val.points, ")")
+      else
+        encode_points("[", val.points, "]")
+      end
+    when Polygon
+      encode_points("(", val.points, ")")
+    when Interval
+      # https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-INTERVAL-INPUT
+      text("#{val.months} months #{val.days} days #{val.microseconds} microseconds")
+    when Span
+      text("#{val.total_seconds_i64} seconds #{val.nanoseconds // 1000} microseconds")
+    else
+      text(val.to_s)
+    end
+  end
+
+  private def self.encode_points(left : String, points : Array(Point), right : String) : Param
+    string = String.build do |io|
+      io << left
+      points.each_with_index do |point, i|
+        io << "," if i > 0
+        io << "(" << point.x << "," << point.y << ")"
+      end
+      io << right
+    end
+
+    text(string)
+  end
+
+  def self.binary(slice : Bytes, size : Int32) : Param
+    new(slice, size, 1_i16)
+  end
+
+  def self.text(string : String) : Param
+    new(Bytes.new(string.to_unsafe, string.bytesize, read_only: true), string.bytesize, 0_i16, string)
+  end
+
+  # The array literal of *array*: `{1,2,3}`, `{"a","b"}`, `{NULL}`.
+  def self.encode_array(array : Array(DBValue)) : String
+    String.build(array.size + 2) do |io|
+      encode_array(io, array)
+    end
+  end
+
+  def self.encode_array(io : String::Builder, value : DBValue) : Nil
+    case value
+    when Array
+      io << "{"
+      value.each_with_index do |item, index|
+        io << "," if index > 0
+        encode_array(io, item)
+      end
+      io << "}"
+    when Nil
+      io << "NULL"
+    when Bool
+      io << (value ? 't' : 'f')
+    when Bytes
+      io << %{"\\\\x}
+      value.each_with_index do |byte, _|
+        io << byte.to_s(16).rjust(2, '0')
+      end
+      io << '"'
+    when String
+      encode_string(io, value)
+    when Time
+      encode_string(io, value.to_rfc3339(9))
+    when CustomValue
+      encode_string(io, value.to_s)
+    else
+      io << value.to_s
+    end
+  end
+
+  # A double-quoted array element, `"` and `\` escaped by a backslash.
+  private def self.encode_string(io : String::Builder, value : String) : Nil
+    io << '"'
+    value.each_char do |char|
+      io << '\\' if char == '"' || char == '\\'
+      io << char
+    end
+    io << '"'
+  end
+end
