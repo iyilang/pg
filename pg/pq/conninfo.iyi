@@ -1,0 +1,206 @@
+# Where and as whom to connect: a `postgres://` URL, a libpq `key=value`
+# string, or the parts, each defaulted from the `PG*` environment variables
+# as libpq defaults them.
+module pg/pq/conninfo
+
+import std/env
+import std/file
+import std/path::{Path}
+import std/text
+import std/uri::{URI, Params}
+import db/db/errors::{DBError, ArgumentError}
+import pg/pq/pgpass::{PgPass}
+
+pub struct ConnInfo
+  SOCKET_SEARCH = ["/run/postgresql", "/tmp", "/var/run/postgresql"]
+
+  SUPPORTED_AUTH_METHODS = ["cleartext", "md5", "scram-sha-256", "scram-sha-256-plus"]
+
+  SSL_MODES = [:disable, :allow, :prefer, :require, :"verify-ca", :"verify-full"]
+
+  # The host. If it starts with a / it is the directory of a local Unix
+  # socket.
+  getter host : String
+
+  # The port, defaults to 5432. Also names a Unix socket's file.
+  getter port : Int32
+
+  # The database name.
+  getter database : String
+
+  # The user.
+  getter user : String
+
+  # The password. Optional.
+  getter password : String?
+
+  # The sslmode: `:prefer` unless given.
+  getter sslmode : Symbol
+
+  # The sslcert. Optional.
+  getter sslcert : String?
+
+  # The sslkey. Optional.
+  getter sslkey : String?
+
+  # The sslrootcert. Optional.
+  getter sslrootcert : String?
+
+  # The application name. Optional (defaults to "crystal").
+  getter application_name : String
+
+  # `"database"` (or `"true"`) for a replication connection.
+  getter replication : String?
+
+  # The authentication methods the server may ask for.
+  getter auth_methods : Array(String)
+
+  # A connection description from its parts; what is not given is taken from
+  # the environment (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
+  # `PGPASSWORD`, `PGAPPNAME`) or the password file.
+  def initialize(host : String? = nil, database : String? = nil, user : String? = nil, password : String? = nil, port : Int32? = nil, sslmode : Symbol = :prefer, application_name : String? = nil, @replication : String? = nil)
+    @port = port || ((ENV["PGPORT"]? || "").to_i? || 5432)
+    @host = ConnInfo.default_host(host, @port)
+    @database = ConnInfo.default_database(database).lchop('/')
+    @user = user || ENV["PGUSER"]? || ConnInfo.current_user_name
+    @sslmode = sslmode
+    @password = password || ENV["PGPASSWORD"]? || PgPass.locate(@host, @port, @database, @user)
+    @application_name = application_name || ENV["PGAPPNAME"]? || "crystal"
+    @auth_methods = ["scram-sha-256-plus", "scram-sha-256", "md5"]
+    @sslcert = nil
+    @sslkey = nil
+    @sslrootcert = nil
+  end
+
+  # From either a `postgres://` (or `postgresql://`) URL or a libpq
+  # `key=value` string.
+  def self.from_conninfo_string(conninfo : String) : ConnInfo | DBError
+    if conninfo.starts_with?("postgres://") || conninfo.starts_with?("postgresql://")
+      uri = URI.parse?(conninfo)
+      return ArgumentError.new("invalid connection URI: #{conninfo}") if uri.nil?
+      from_uri(uri)
+    else
+      return ConnInfo.new if conninfo == ""
+
+      args = {} of String => String
+      conninfo.split(' ').each do |pair|
+        next if pair.empty?
+        k, eq, v = pair.partition('=')
+        return ArgumentError.new("invalid paramater: #{pair}") if eq.empty?
+        args[k] = v
+      end
+      from_hash(args)
+    end
+  end
+
+  # From a `URI`: its host (or the `host` parameter), port, path as the
+  # database, user and password, and `application_name`, `replication`,
+  # `sslmode`, `sslcert`, `sslkey`, `sslrootcert` and `auth_methods` from
+  # its query.
+  def self.from_uri(uri : URI) : ConnInfo | DBError
+    params = Params.parse(uri.query || "")
+    hostname = (uri.hostname || "").presence || params["host"]? || ""
+    port = uri.port || parse_port(params["port"]?)!
+    info = ConnInfo.new(hostname.presence, uri.path, uri.user, uri.password, port, :prefer, params["application_name"]?, params["replication"]?)
+    params.each do |key, value|
+      handled = info.handle_sslparam(key, value)
+      return handled if handled.is_a?(DBError)
+    end
+    info
+  end
+
+  # From libpq "conninfo" keys: `"host"`, `"dbname"`, `"user"`,
+  # `"password"`, `"port"`, `"sslmode"`, `"sslcert"`, `"sslkey"`,
+  # `"sslrootcert"`, `"application_name"`, `"replication"` and
+  # `"auth_methods"`.
+  def self.from_hash(params : Hash(String, String)) : ConnInfo | DBError
+    port = parse_port(params["port"]?)!
+    info = ConnInfo.new(params["host"]?, params["dbname"]?, params["user"]?,
+      params["password"]?, port, :prefer, params["application_name"]?, params["replication"]?)
+    params.each do |key, value|
+      handled = info.handle_sslparam(key, value)
+      return handled if handled.is_a?(DBError)
+    end
+    info
+  end
+
+  # The sslmode *mode* names, or `ArgumentError`.
+  def self.parse_sslmode(mode : String?) : Symbol | DBError
+    case mode
+    when nil, "prefer" then :prefer
+    when "disable"     then :disable
+    when "allow"       then :allow
+    when "require"     then :require
+    when "verify-ca"   then :"verify-ca"
+    when "verify-full" then :"verify-full"
+    else
+      ArgumentError.new("sslmode #{mode} not supported")
+    end
+  end
+
+  protected def self.parse_port(port : String?) : Int32? | DBError
+    return nil if port.nil? || port.empty?
+    port.to_i? || ArgumentError.new("invalid port: #{port}")
+  end
+
+  protected def handle_sslparam(key : String, value : String) : Nil | DBError
+    case key
+    when "sslmode"
+      @sslmode = ConnInfo.parse_sslmode(value)!
+    when "sslcert"
+      @sslcert = value
+    when "sslkey"
+      @sslkey = value
+    when "sslrootcert"
+      @sslrootcert = value
+    when "auth_methods"
+      methods = [] of String
+      value.split(',').each do |method|
+        name = method.downcase
+        next if name.empty? || methods.includes?(name)
+        return ArgumentError.new("invalid auth_method #{name}") unless SUPPORTED_AUTH_METHODS.includes?(name)
+        methods << name
+      end
+      @auth_methods = methods
+    else
+      # ignore
+    end
+    nil
+  end
+
+  protected def self.default_host(h : String?, port : Int32) : String
+    socket_name = ".s.PGSQL.#{port}"
+
+    if host = (h || "").presence || ENV["PGHOST"]?
+      # For backwards compatibility: a path to the socket file itself means
+      # the directory that holds it.
+      path = Path.new(host)
+      return path.basename == socket_name ? path.parent.to_s : host
+    end
+
+    {% unless flag?(:win32) %}
+      SOCKET_SEARCH.each do |dir|
+        return dir if File.exists?(File.join(dir, socket_name))
+      end
+    {% end %}
+    "localhost"
+  end
+
+  protected def self.default_database(db : String?) : String
+    if db && db != "/" && !db.empty?
+      db
+    else
+      ENV["PGDATABASE"]? || current_user_name
+    end
+  end
+
+  # The login name, the default user and database. Windows has no answer
+  # here and says "postgres", as crystal-pg does.
+  def self.current_user_name : String
+    {% if flag?(:win32) %}
+      "postgres"
+    {% else %}
+      ENV["USER"]? || ENV["LOGNAME"]? || "postgres"
+    {% end %}
+  end
+end

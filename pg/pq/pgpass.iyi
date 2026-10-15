@@ -1,0 +1,50 @@
+# The password file: `~/.pgpass`, or the file `PGPASSFILE` names.
+#
+# https://www.postgresql.org/docs/current/libpq-pgpass.html
+module pg/pq/pgpass
+
+import std/env
+import std/file
+import std/path::{Path}
+import std/text
+import std/log::{Log, Logger}
+
+# The logger for this library, crystal-pg's `PQ::Log`; its source is "pg".
+pub LOG = Log.for("pg")
+
+pub class PgPass
+  # The password the file holds for *host*, *port*, *db* and *user*, or nil.
+  def self.locate(host : String, port : Int32, db : String, user : String) : String?
+    filename = ENV["PGPASSFILE"]? || Path["~/.pgpass"].expand(home: true).to_s
+
+    unless File.exists?(filename) && File.file?(filename)
+      LOG.debug { "No pgpass file available" }
+      return nil
+    end
+
+    {% unless flag?(:win32) %}
+      unless (File.info(filename).permissions.to_i & 0o7177) == 0
+        LOG.warn { "Cannot use pgpass file - permissions are inappropriate must be 0600 or less" }
+      end
+    {% end %}
+
+    File.read_lines(filename).each do |line|
+      next if line.starts_with?("#")
+
+      fields = line.split(':')
+
+      unless fields.size == 5
+        LOG.warn { "PGPass file does not appear to be properly formatted - errors may occur" }
+        next
+      end
+
+      next unless fields[0] == "*" || host == fields[0]
+      next unless fields[1] == "*" || port == fields[1].to_i?
+      next unless fields[2] == "*" || db == fields[2]
+      next unless fields[3] == "*" || user == fields[3]
+
+      return fields[4]
+    end
+    nil
+  end
+end
