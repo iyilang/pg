@@ -1,3 +1,39 @@
+## v0.2.1
+
+Fixes from a comparison with crystal-pg, each with a test.
+
+* The SCRAM client nonce comes from `Random::Secure`, as crystal-pg's does;
+  it came from the seeded, guessable `Random`.
+* `numeric` `Infinity` and `-Infinity` (PostgreSQL 14+) read as a `Numeric`
+  (`infinite?`, `to_s`, `to_f`) where they panicked; `read(BigDecimal)` and
+  `read(BigRational)` refuse them and NaN, which they read as zero.
+* A `Time` argument is sent to the microsecond, cut: the server rounded the
+  nine digits sent, and `23:59:59.999999999` became the next day
+  (crystal-pg #252).
+* COPY FROM STDIN sends as it goes, a buffer at a time, where it held the
+  whole input until `close`. A write buffer grown for a large message is
+  let go once it is sent.
+* Two tasks sending on one connection - a replication keepalive beside the
+  run loop's - send each message once and whole; a send that waited on the
+  socket could have its bytes sent again by the other.
+* A `Record` argument is written with its fields quoted, so commas,
+  parentheses, quotes, backslashes and empty strings come through; `Bytes`
+  and `Time` fields in their text forms.
+* More than 65535 arguments, the protocol's limit, are refused; the count
+  was sent cut to 16 bits.
+* A malformed message from the server - a length under four, a body shorter
+  than its fields, a negative length - is a `StreamError` (the connection
+  lost), not a panic. So is a decoder that reads past its column.
+* An unreadable password file is passed over with a warning, not a panic; on
+  Windows the file is libpq's `%APPDATA%\postgresql\pgpass.conf`.
+* A `PGPORT` that is not a number is an `ArgumentError`, not port 5432. The
+  default user is the account the program runs as (`std/user`), not
+  `$USER` or `"postgres"`, and the default database is the user's name,
+  `PGUSER`'s included, as libpq has them. A connection parameter this driver
+  ignores is logged; `ConnInfo.new` refuses an unknown `sslmode`.
+* `version` reads a pre-release server's (`16beta1`, `17devel`) by its
+  leading digits, where it answered 0.
+
 ## v0.2.0
 
 On iyi 0.18.0, whose `std/tls` and resolver this release is built on; iyi

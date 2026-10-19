@@ -69,8 +69,11 @@ connection's: `application_name`, `sslmode`, `sslrootcert`, `sslcert`,
 `sslkey`, `ssl_min_protocol_version`, `channel_binding`, `auth_methods`,
 `replication`, and `host` for a Unix socket directory. Missing parts come
 from `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGAPPNAME`
-and the password file (`~/.pgpass` or `PGPASSFILE`), as libpq takes them. A
-host is a name, resolved by iyi's own resolver, or an address.
+and the password file (`~/.pgpass`, `%APPDATA%\postgresql\pgpass.conf` on
+Windows, or `PGPASSFILE`), as libpq takes them; the user is the account the
+program runs as, and the database the user's name. A host is a name,
+resolved by iyi's own resolver, or an address. A parameter this driver does
+not know is logged as ignored (iyi-db's pool options are known).
 
 A server error is a `PQError` (module `pg/pq/errors`) whose `fields` hold
 what the server sent: `err.field_message(:code)`, `:detail`, `:hint`, ...
@@ -232,9 +235,11 @@ The server needs `wal_level=logical`. Without `group:`,
 | record, and registered composite types | `Record` (3) |
 | the arrays above | `Array(DBValue)` or a typed `Array(T)` |
 
-1: `Numeric` keeps every digit. `to_f` is approximate; `to_big_d` and
-`to_big_r` (and `read(BigDecimal)`, `read(BigRational)`) are exact. crystal-pg
-needed LibGMP and an extra require for those; iyi's `std/big` needs neither.
+1: `Numeric` keeps every digit, and reads NaN and (PostgreSQL 14+)
+`Infinity` and `-Infinity`. `to_f` is approximate; `to_big_d` and `to_big_r`
+(and `read(BigDecimal)`, `read(BigRational)`, which refuse NaN and the
+infinities) are exact. crystal-pg needed LibGMP and an extra require for
+those; iyi's `std/big` needs neither.
 
 2: A PostgreSQL interval does not map onto one iyi type. `Interval#to_span`
 answers a `Span` (with `approx_months:` for intervals with months), and
@@ -244,9 +249,11 @@ answers a `Span` (with `approx_months:` for intervals with months), and
 own type. A named composite type has its own OID; register it with
 `Decoders.register_decoder RecordDecoder.new([oid])`.
 
-Values bound as arguments are iyi-db's `DBValue`s: the scalars, `Time`,
-`Span`, `Bytes`, arrays, and this driver's value classes (`Numeric`,
-`Interval`, the geometric types, `UUIDValue`, `JSONValue`, `Record`).
+Values bound as arguments are iyi-db's `DBValue`s: the scalars, `Time` (to
+the microsecond, PostgreSQL's precision), `Span`, `Bytes`, arrays, and this
+driver's value classes (`Numeric`, `Interval`, the geometric types,
+`UUIDValue`, `JSONValue`, `Record`). A statement takes at most 65535 of
+them.
 
 ## Authentication methods
 
