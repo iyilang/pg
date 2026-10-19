@@ -11,6 +11,7 @@ import db/db/value::{DBValue, CustomValue}
 import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
 import pg/interval::{Interval}
 import pg/record::{Record}
+import pg/range::{RangeValue, MultirangeValue}
 
 pub struct Param
   HEX = "0123456789abcdef"
@@ -56,6 +57,10 @@ pub struct Param
       value.to_rfc3339(6)
     when Record
       encode_record(value)
+    when RangeValue
+      encode_range(value)
+    when MultirangeValue
+      "{" + value.ranges.map { |range| encode_range(range) }.join(",") + "}"
     when Point
       "(#{value.x},#{value.y})"
     when Line
@@ -102,6 +107,19 @@ pub struct Param
         encode_string(io, text_form(field)) unless field.nil?
       end
       io << ')'
+    end
+  end
+
+  # The range literal of *range*: `empty`, or `[1,5)`, `(,"a b"]`, an
+  # unbounded side empty and every bound quoted as a composite field is.
+  def self.encode_range(range : RangeValue) : String
+    return "empty" if range.empty?
+    String.build do |io|
+      io << (range.lower_inclusive? ? '[' : '(')
+      encode_string(io, text_form(range.lower)) unless range.lower.nil?
+      io << ','
+      encode_string(io, text_form(range.upper)) unless range.upper.nil?
+      io << (range.upper_inclusive? ? ']' : ')')
     end
   end
 

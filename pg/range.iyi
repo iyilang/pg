@@ -1,0 +1,212 @@
+# Range and multirange values: `int4range`, `numrange`, `tstzrange`, ...,
+# their PostgreSQL 14 multiranges, and a range type of one's own. crystal-pg
+# has none of them; a range column read as `Bytes` there.
+#
+# Each built-in range, multirange and array of either is registered below.
+# `RangeDecoder.new([oid], subtype_oid)` registers the same reading for a
+# `CREATE TYPE ... AS RANGE`, whose OIDs `SELECT 'myrange'::regtype::oid`
+# and `SELECT rngsubtype FROM pg_range WHERE rngtypid = 'myrange'::regtype`
+# tell; `MultirangeDecoder` likewise for its multirange.
+module pg/range
+
+import std/int
+import std/text
+import db/db/errors::{DBError}
+import db/db/value::{DBValue, CustomValue}
+import pg/pq/stream::{ByteSource}
+import pg/decoder::{Decoder, Decoders, ArrayDecoder}
+
+# What `RangeValue.empty` passes its constructor; no other caller has one.
+struct EmptyRange
+end
+
+# One range: its bounds, `nil` for an unbounded side, and whether each is
+# inclusive. An unbounded side is never inclusive, as the server has it:
+# `[,5)` is `(,5)`. An empty range has no bounds.
+#
+# A discrete range (`int4range`, `int8range`, `daterange`) reads back in the
+# server's canonical form, `[lower,upper)`: `[1,5]` reads as `[1,6)`.
+pub class RangeValue < CustomValue
+  getter lower : DBValue
+  getter upper : DBValue
+  @lower_inclusive : Bool
+  @upper_inclusive : Bool
+  @empty : Bool
+
+  def initialize(@lower : DBValue = nil, @upper : DBValue = nil, lower_inclusive : Bool = true, upper_inclusive : Bool = false)
+    @lower_inclusive = lower_inclusive && !@lower.nil?
+    @upper_inclusive = upper_inclusive && !@upper.nil?
+    @empty = false
+  end
+
+  def initialize(marker : EmptyRange)
+    @lower = nil
+    @upper = nil
+    @lower_inclusive = false
+    @upper_inclusive = false
+    @empty = true
+  end
+
+  # The range with no points, `'empty'`.
+  def self.empty : RangeValue
+    new(EmptyRange.new)
+  end
+
+  def lower_inclusive? : Bool
+    @lower_inclusive
+  end
+
+  def upper_inclusive? : Bool
+    @upper_inclusive
+  end
+
+  def empty? : Bool
+    @empty
+  end
+
+  def ==(other : RangeValue) : Bool
+    return @empty == other.empty? if @empty || other.empty?
+    lower == other.lower && upper == other.upper &&
+      lower_inclusive? == other.lower_inclusive? && upper_inclusive? == other.upper_inclusive?
+  end
+
+  # The range as the server prints it: `[1,5)`, `(,10]`, `empty`, a bound
+  # double-quoted when it holds a space or one of `"\,()[]`.
+  def to_s : String
+    return "empty" if @empty
+    String.build do |io|
+      io << (@lower_inclusive ? '[' : '(')
+      write_bound(io, @lower)
+      io << ','
+      write_bound(io, @upper)
+      io << (@upper_inclusive ? ']' : ')')
+    end
+  end
+
+  def inspect : String
+    "PG::RangeValue(#{to_s})"
+  end
+
+  # The characters that make a printed bound quoted, besides whitespace.
+  QUOTED = ['"', '\\', ',', '(', ')', '[', ']']
+
+  # PostgreSQL's `range_bound_escape`.
+  private def write_bound(io : String::Builder, bound : DBValue) : Nil
+    return if bound.nil?
+    text = bound.to_s
+    unless text.empty? || text.chars.any? { |char| char.whitespace? || QUOTED.includes?(char) }
+      io << text
+      return
+    end
+    io << '"'
+    text.each_char do |char|
+      io << char if char == '"' || char == '\\'
+      io << char
+    end
+    io << '"'
+  end
+end
+
+# The ranges of a multirange, in the server's order: sorted, merged, no
+# empty one.
+pub class MultirangeValue < CustomValue
+  getter ranges : Array(RangeValue)
+
+  def initialize(@ranges : Array(RangeValue) = [] of RangeValue)
+  end
+
+  def ==(other : MultirangeValue) : Bool
+    ranges == other.ranges
+  end
+
+  # `{[1,3),[5,7)}`, `{}` without a range.
+  def to_s : String
+    "{" + @ranges.map(&.to_s).join(",") + "}"
+  end
+
+  def inspect : String
+    "PG::MultirangeValue(#{to_s})"
+  end
+end
+
+# Reads the binary range format: a flags byte, then each bound the flags do
+# not rule out as its size and the bytes of the subtype's binary form.
+pub class RangeDecoder < Decoder
+  EMPTY    = 0x01_u8
+  LB_INC   = 0x02_u8
+  UB_INC   = 0x04_u8
+  LB_INF   = 0x08_u8
+  UB_INF   = 0x10_u8
+  LB_NULL  = 0x20_u8
+  UB_NULL  = 0x40_u8
+  NO_LOWER = EMPTY | LB_INF | LB_NULL
+  NO_UPPER = EMPTY | UB_INF | UB_NULL
+
+  getter oids : Array(Int32)
+  getter subtype_oid : Int32
+
+  def initialize(@oids : Array(Int32), @subtype_oid : Int32)
+  end
+
+  def type_name : String
+    "PG::RangeValue"
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    flags = io.read_byte!
+    return RangeValue.empty if flags & EMPTY != 0
+    lower = flags & NO_LOWER == 0 ? read_bound(io)! : nil
+    upper = flags & NO_UPPER == 0 ? read_bound(io)! : nil
+    RangeValue.new(lower, upper, flags & LB_INC != 0, flags & UB_INC != 0)
+  end
+
+  private def read_bound(io : ByteSource) : DBValue | DBError
+    size = io.read_i32!
+    Decoders.from_oid(@subtype_oid).decode(io, size, @subtype_oid)
+  end
+end
+
+# Reads the binary multirange format: the range count, then each range as
+# its size and the binary range format.
+pub class MultirangeDecoder < Decoder
+  getter oids : Array(Int32)
+  getter range : RangeDecoder
+
+  def initialize(@oids : Array(Int32), subtype_oid : Int32)
+    @range = RangeDecoder.new([] of Int32, subtype_oid)
+  end
+
+  def type_name : String
+    "PG::MultirangeValue"
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    count = io.read_i32!
+    ranges = [] of RangeValue
+    count.times do
+      size = io.read_i32
+      return size if size.is_a?(DBError)
+      value = @range.decode(io, size, oid)
+      return value if value.is_a?(DBError)
+      ranges << value.as(RangeValue)
+    end
+    MultirangeValue.new(ranges)
+  end
+end
+
+# https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_range.dat:
+# each range's OID, its array's, its multirange's and that one's array's,
+# and its subtype.
+{% for range in [
+                  {3904, 3905, 4451, 6150, 23},   # int4range: int4
+                  {3926, 3927, 4536, 6157, 20},   # int8range: int8
+                  {3906, 3907, 4532, 6151, 1700}, # numrange: numeric
+                  {3908, 3909, 4533, 6152, 1114}, # tsrange: timestamp
+                  {3910, 3911, 4534, 6153, 1184}, # tstzrange: timestamptz
+                  {3912, 3913, 4535, 6155, 1082}, # daterange: date
+                ] %}
+  Decoders.register_decoder RangeDecoder.new([{{ range[0] }}], {{ range[4] }})
+  Decoders.register_decoder ArrayDecoder.new([{{ range[1] }}], RangeDecoder.new([{{ range[0] }}], {{ range[4] }}))
+  Decoders.register_decoder MultirangeDecoder.new([{{ range[2] }}], {{ range[4] }})
+  Decoders.register_decoder ArrayDecoder.new([{{ range[3] }}], MultirangeDecoder.new([{{ range[2] }}], {{ range[4] }}))
+{% end %}

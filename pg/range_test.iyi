@@ -1,0 +1,260 @@
+# Range and multirange values (`pg/range.iyi`). crystal-pg has no range
+# types; these hold the reading and binding this port gives them.
+module pg/range_test
+
+import std/int
+import std/time::{Time}
+import db/db/value::{DBValue}
+import db/db/spec::{describe, it}
+import pg/range::{RangeValue, MultirangeValue, RangeDecoder, MultirangeDecoder}
+import pg/decoder::{Decoders, ArrayDecoder}
+import pg/numeric::{Numeric}
+import pg/testing/spec_helper::*
+
+# What a plain `read` of `select <query>` answers.
+def select_value(query : String) : DBValue
+  PG_DB.query_one("select #{query}") { |rs| rs.read }.or_panic
+end
+
+# Selects *query* and checks it reads as *expected* and, unless its bounds
+# are times, which `Time#to_s` prints its own way, prints as the server
+# prints it.
+def test_range(type : String, literal : String, expected : RangeValue) : Nil
+  it "reads #{literal}::#{type}" do
+    value = select_value("'#{literal}'::#{type}")
+    assert value.is_a?(RangeValue), "#{literal}::#{type}: got #{value.inspect}"
+    assert value == expected, "#{literal}::#{type}: expected #{expected.inspect}, got #{value.inspect}"
+    unless expected.lower.is_a?(Time) || expected.upper.is_a?(Time)
+      text = PG_DB.query_one("select '#{literal}'::#{type}::text", as: String).or_panic
+      assert value.to_s == text, "#{literal}::#{type}: printed #{value.to_s}, the server #{text}"
+    end
+  end
+end
+
+# Binds *value* as a *type* and checks the server reads it as *text* and
+# it reads back as itself.
+def test_bind(type : String, value : DBValue, text : String) : Nil
+  it "binds #{text} as #{type}" do
+    printed = PG_DB.query_one("select $1::#{type}::text", args: [value], as: String).or_panic
+    assert printed == text, "#{type}: the server read #{printed}, expected #{text}"
+    back = PG_DB.query_one("select $1::#{type}", args: [value]) { |rs| rs.read }.or_panic
+    assert back == value, "#{type}: expected #{value.inspect}, got #{back.inspect}"
+  end
+end
+
+def numeric(text : String) : Numeric
+  PG_DB.query_one("select '#{text}'::numeric", as: Numeric).or_panic
+end
+
+def oid_of(type : String) : Int32
+  PG_DB.query_one("select '#{type}'::regtype::oid", as: UInt32).or_panic.to_i32
+end
+
+describe "PG::RangeValue" do
+  it "prints as the server does" do
+    assert RangeValue.new(1, 5).to_s == "[1,5)"
+    assert RangeValue.new(nil, 10, upper_inclusive: true).to_s == "(,10]"
+    assert RangeValue.new(3, nil, lower_inclusive: false).to_s == "(3,)"
+    assert RangeValue.new.to_s == "(,)"
+    assert RangeValue.empty.to_s == "empty"
+    assert RangeValue.new("a b", "c,\"d\\").to_s == "[\"a b\",\"c,\"\"d\\\\\")"
+    assert RangeValue.new("", "x").to_s == "[\"\",x)"
+  end
+
+  it "has no inclusive unbounded side" do
+    range = RangeValue.new(nil, nil, lower_inclusive: true, upper_inclusive: true)
+    assert !range.lower_inclusive?
+    assert !range.upper_inclusive?
+    assert range == RangeValue.new
+  end
+
+  it "compares bounds, inclusivity and emptiness" do
+    assert RangeValue.new(1, 5) == RangeValue.new(1, 5)
+    assert RangeValue.new(1, 5) != RangeValue.new(1, 6)
+    assert RangeValue.new(1, 5) != RangeValue.new(1, 5, upper_inclusive: true)
+    assert RangeValue.new(1, 5) != RangeValue.new(1, 5, lower_inclusive: false)
+    assert RangeValue.empty == RangeValue.empty
+    assert RangeValue.empty != RangeValue.new
+    assert RangeValue.empty.empty?
+    assert !RangeValue.new.empty?
+  end
+
+  test_range "int4range", "[1,5)", RangeValue.new(1, 5)
+  test_range "int4range", "[1,5]", RangeValue.new(1, 6)
+  test_range "int4range", "(,10]", RangeValue.new(nil, 11)
+  test_range "int4range", "[3,)", RangeValue.new(3, nil)
+  test_range "int4range", "(,)", RangeValue.new
+  test_range "int4range", "empty", RangeValue.empty
+  test_range "int4range", "[5,5)", RangeValue.empty
+  test_range "int8range", "[-9223372036854775807,9223372036854775807)",
+    RangeValue.new(-9223372036854775807_i64, 9223372036854775807_i64)
+  test_range "int8range", "(,0)", RangeValue.new(nil, 0_i64)
+  test_range "tsrange", "[2020-01-01 10:00,2020-01-02 11:30:15.5)",
+    RangeValue.new(Time.utc(2020, 1, 1, 10, 0, 0), Time.utc(2020, 1, 2, 11, 30, 15, nanosecond: 500_000_000))
+  test_range "tsrange", "(2020-01-01,]",
+    RangeValue.new(Time.utc(2020, 1, 1, 0, 0, 0), nil, lower_inclusive: false)
+  test_range "daterange", "[2020-01-01,2020-02-01]",
+    RangeValue.new(Time.utc(2020, 1, 1, 0, 0, 0), Time.utc(2020, 2, 2, 0, 0, 0))
+  test_range "daterange", "empty", RangeValue.empty
+
+  it "reads the bounds' own types" do
+    int4 = select_value("'[1,2)'::int4range").as(RangeValue)
+    assert int4.lower.is_a?(Int32)
+    int8 = select_value("'[1,2)'::int8range").as(RangeValue)
+    assert int8.lower.is_a?(Int64) && int8.upper.is_a?(Int64)
+  end
+
+  it "reads numrange bounds as Numeric, inclusive and exclusive" do
+    range = select_value("'(1.5,2.25]'::numrange").as(RangeValue)
+    assert range == RangeValue.new(numeric("1.5"), numeric("2.25"), lower_inclusive: false, upper_inclusive: true)
+    assert range.lower.is_a?(Numeric)
+    assert range.to_s == "(1.5,2.25]"
+    assert select_value("'[-3,)'::numrange") == RangeValue.new(numeric("-3"), nil)
+  end
+
+  it "reads tstzrange bounds as UTC instants" do
+    range = select_value("'[2020-01-01 10:00-02,2020-01-01 14:00+01)'::tstzrange").as(RangeValue)
+    assert range == RangeValue.new(Time.utc(2020, 1, 1, 12, 0, 0), Time.utc(2020, 1, 1, 13, 0, 0))
+    assert select_value("'empty'::tstzrange") == RangeValue.empty
+  end
+
+  it "reads as RangeValue when asked" do
+    range = PG_DB.query_one("select '[2,4)'::int4range", as: RangeValue).or_panic
+    assert range == RangeValue.new(2, 4)
+  end
+
+  it "reads arrays of ranges, NULL as nil" do
+    value = select_value("array['[1,3)'::int4range, 'empty', null, '(,)']")
+    assert value == [RangeValue.new(1, 3), RangeValue.empty, nil, RangeValue.new] of DBValue
+    {"int8range", "numrange", "tsrange", "tstzrange", "daterange"}.each do |type|
+      array = select_value("array['empty'::#{type}, '(,)']")
+      assert array == [RangeValue.empty, RangeValue.new] of DBValue, "#{type}[]: #{array.inspect}"
+    end
+  end
+
+  test_bind "int4range", RangeValue.new(1, 5), "[1,5)"
+  test_bind "int4range", RangeValue.new(nil, 10), "(,10)"
+  test_bind "int4range", RangeValue.new(3, nil), "[3,)"
+  test_bind "int4range", RangeValue.new, "(,)"
+  test_bind "int4range", RangeValue.empty, "empty"
+  test_bind "int8range", RangeValue.new(-5_i64, 9223372036854775806_i64), "[-5,9223372036854775806)"
+  test_bind "tsrange", RangeValue.new(Time.utc(2020, 1, 1, 10, 0, 0), Time.utc(2020, 1, 2, 11, 30, 15, nanosecond: 123_456_000), upper_inclusive: true),
+    %(["2020-01-01 10:00:00","2020-01-02 11:30:15.123456"])
+  test_bind "daterange", RangeValue.new(Time.utc(2020, 1, 1, 0, 0, 0), Time.utc(2020, 3, 1, 0, 0, 0)), "[2020-01-01,2020-03-01)"
+  test_bind "int4range[]", [RangeValue.new(1, 3), RangeValue.empty, nil, RangeValue.new(nil, 2)] of DBValue,
+    "{\"[1,3)\",empty,NULL,\"(,2)\"}"
+
+  it "binds numrange and tstzrange" do
+    num = RangeValue.new(numeric("1.5"), numeric("2.25"), lower_inclusive: false, upper_inclusive: true)
+    assert PG_DB.query_one("select $1::numrange", args: [num], as: RangeValue).or_panic == num
+    assert PG_DB.query_one("select $1::numrange::text", args: [num], as: String).or_panic == "(1.5,2.25]"
+    tstz = RangeValue.new(Time.utc(2020, 1, 1, 12, 0, 0), nil)
+    assert PG_DB.query_one("select $1::tstzrange", args: [tstz], as: RangeValue).or_panic == tstz
+    assert PG_DB.query_one("select $1::tstzrange = '[2020-01-01 12:00Z,)'", args: [tstz], as: Bool).or_panic
+  end
+
+  it "reads and binds a range type of one's own, once registered" do
+    with_connection do |conn|
+      conn.exec("drop type if exists floatrange").or_panic
+      conn.exec("create type floatrange as range (subtype = float8)").or_panic
+      oid = conn.query_one("select 'floatrange'::regtype::oid", as: UInt32).or_panic.to_i32
+      array_oid = conn.query_one("select 'floatrange[]'::regtype::oid", as: UInt32).or_panic.to_i32
+      Decoders.register_decoder RangeDecoder.new([oid], 701)
+      Decoders.register_decoder ArrayDecoder.new([array_oid], RangeDecoder.new([oid], 701))
+      range = conn.query_one("select '[1.5,2.5]'::floatrange", as: RangeValue).or_panic
+      assert range == RangeValue.new(1.5, 2.5, upper_inclusive: true)
+      assert range.lower.is_a?(Float64)
+      bound = RangeValue.new(-0.25, nil, lower_inclusive: false)
+      assert conn.query_one("select $1::floatrange", args: [bound], as: RangeValue).or_panic == bound
+      array = conn.query_one("select array[$1::floatrange, 'empty']", args: [bound]) { |rs| rs.read }.or_panic
+      assert array == [bound, RangeValue.empty] of DBValue
+      conn.exec("drop type floatrange").or_panic
+    end
+  end
+
+  it "binds bounds holding commas, quotes, backslashes, brackets and spaces" do
+    with_connection do |conn|
+      conn.exec("drop type if exists textrange").or_panic
+      conn.exec("create type textrange as range (subtype = text, collation = \"C\")").or_panic
+      oid = conn.query_one("select 'textrange'::regtype::oid", as: UInt32).or_panic.to_i32
+      array_oid = conn.query_one("select 'textrange[]'::regtype::oid", as: UInt32).or_panic.to_i32
+      Decoders.register_decoder RangeDecoder.new([oid], 25)
+      Decoders.register_decoder ArrayDecoder.new([array_oid], RangeDecoder.new([oid], 25))
+      [
+        RangeValue.new("a, \"b\"", "z\\ (d]"),
+        RangeValue.new("", " "),
+        RangeValue.new(nil, "empty"),
+        RangeValue.new("{x}", nil, lower_inclusive: false),
+      ].each do |range|
+        back = conn.query_one("select $1::textrange", args: [range], as: RangeValue).or_panic
+        assert back == range, "expected #{range.inspect}, got #{back.inspect}"
+        text = conn.query_one("select $1::textrange::text", args: [range], as: String).or_panic
+        assert back.to_s == text, "printed #{back.to_s}, the server #{text}"
+      end
+      ranges = [RangeValue.new("a\"", "b\\"), nil, RangeValue.new(",", "}")] of DBValue
+      back = conn.query_one("select $1::textrange[]", args: [ranges]) { |rs| rs.read }.or_panic
+      assert back == ranges, back.inspect
+
+      if db_version_gte(14)
+        multi_oid = conn.query_one("select rngmultitypid::int4 from pg_range where rngtypid = 'textrange'::regtype", as: Int32).or_panic
+        Decoders.register_decoder MultirangeDecoder.new([multi_oid], 25)
+        multi = MultirangeValue.new([RangeValue.new("a,b", "c\"d"), RangeValue.new("x\\y", nil, upper_inclusive: true)])
+        back = conn.query_one("select $1::textmultirange", args: [multi], as: MultirangeValue).or_panic
+        assert back == multi, back.inspect
+      end
+      conn.exec("drop type textrange").or_panic
+    end
+  end
+end
+
+describe "PG::MultirangeValue" do
+  it "prints as the server does" do
+    assert MultirangeValue.new([RangeValue.new(1, 3), RangeValue.new(5, 7)]).to_s == "{[1,3),[5,7)}"
+    assert MultirangeValue.new.to_s == "{}"
+    assert MultirangeValue.new([RangeValue.new(nil, 3, upper_inclusive: true)]).to_s == "{(,3]}"
+  end
+
+  it "compares its ranges" do
+    assert MultirangeValue.new([RangeValue.new(1, 3)]) == MultirangeValue.new([RangeValue.new(1, 3)])
+    assert MultirangeValue.new([RangeValue.new(1, 3)]) != MultirangeValue.new([RangeValue.new(1, 4)])
+    assert MultirangeValue.new != MultirangeValue.new([RangeValue.new(1, 3)])
+  end
+
+  if db_version_gte(14)
+    it "reads every built-in multirange" do
+      {
+        "int4multirange" => "{[1,3), [5,7)}",
+        "int8multirange" => "{(,0), [10,)}",
+        "nummultirange"  => "{[1.5,2.5], (3,4)}",
+        "tsmultirange"   => "{[2020-01-01,2020-01-02), [2020-02-01 10:00,)}",
+        "tstzmultirange" => "{[2020-01-01 00:00Z,2020-01-02 00:00Z)}",
+        "datemultirange" => "{[2020-01-01,2020-01-05], [2020-03-01,2020-03-02)}",
+      }.each do |type, literal|
+        value = select_value("'#{literal}'::#{type}")
+        assert value.is_a?(MultirangeValue), "#{type}: #{value.inspect}"
+        same = PG_DB.query_one("select $1::#{type} = '#{literal}'::#{type}", args: [value], as: Bool).or_panic
+        assert same, "#{type}: read #{value.inspect} from #{literal}"
+        empty = select_value("'{}'::#{type}")
+        assert empty == MultirangeValue.new, "#{type}: #{empty.inspect}"
+        array = select_value("array['{}'::#{type}, null]")
+        assert array == [MultirangeValue.new, nil] of DBValue, "#{type}[]: #{array.inspect}"
+      end
+    end
+
+    it "reads the ranges of a multirange, merged and in order" do
+      value = select_value("'{[5,7), [1,3), [2,4), empty}'::int4multirange")
+      assert value == MultirangeValue.new([RangeValue.new(1, 4), RangeValue.new(5, 7)]), value.inspect
+      ts = select_value("'{[2020-01-01,2020-01-02)}'::tsmultirange")
+      assert ts == MultirangeValue.new([RangeValue.new(Time.utc(2020, 1, 1, 0, 0, 0), Time.utc(2020, 1, 2, 0, 0, 0))]), ts.inspect
+      multi = PG_DB.query_one("select '{[1,2)}'::int4multirange", as: MultirangeValue).or_panic
+      assert multi.ranges == [RangeValue.new(1, 2)]
+    end
+
+    test_bind "int4multirange", MultirangeValue.new([RangeValue.new(1, 3), RangeValue.new(5, nil)]), "{[1,3),[5,)}"
+    test_bind "int4multirange", MultirangeValue.new, "{}"
+    test_bind "datemultirange", MultirangeValue.new([RangeValue.new(Time.utc(2020, 1, 1, 0, 0, 0), Time.utc(2020, 1, 3, 0, 0, 0))]),
+      "{[2020-01-01,2020-01-03)}"
+    test_bind "int8multirange[]", [MultirangeValue.new([RangeValue.new(nil, 0_i64)]), MultirangeValue.new] of DBValue,
+      %({"{(,0)}","{}"})
+  end
+end
