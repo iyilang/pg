@@ -23,7 +23,7 @@ jobs:
           --health-retries 10
     env:
       # The oldest iyi this release supports (README, Requirements).
-      IYI_VERSION: 0.17.0
+      IYI_VERSION: 0.18.0
       DATABASE_URL: postgres://postgres:postgres@127.0.0.1/iyi_pg_test
     steps:
       - uses: actions/checkout@v4
@@ -35,10 +35,66 @@ jobs:
 
       - run: iyi version
 
+      # Against the server without TLS: `sslmode=prefer` is answered "no"
+      # and no handshake runs inside db/db/spec's tasks, whose 256 KiB stack
+      # a debug build's handshake overruns in iyi 0.18.0 (iyilang/iyi#130).
       - name: Test
         run: iyi test pg
 
-      # No "test from artifacts" step as iyi-db has: iyi 0.17.0 does not write
+      - name: Give the server TLS
+        run: |
+          dir="$RUNNER_TEMP/certs"
+          mkdir -p "$dir"
+          cd "$dir"
+          # P-256 keys, each certificate's extensions given whole, none taken
+          # from openssl.cnf
+          openssl ecparam -name prime256v1 -genkey -noout -out ca.key
+          openssl req -new -key ca.key -subj "/CN=iyi-pg test CA" -out ca.csr
+          printf '%s\n' "basicConstraints=critical,CA:TRUE" "keyUsage=critical,keyCertSign,cRLSign" > ca.ext
+          openssl x509 -req -in ca.csr -signkey ca.key -days 2 -out ca.crt -extfile ca.ext
+          # sign NAME SUBJECT EXTENSIONS: a key and a certificate for it from the CA
+          sign() {
+            openssl ecparam -name prime256v1 -genkey -noout -out "$1.key"
+            openssl req -new -key "$1.key" -subj "$2" -out "$1.csr"
+            printf '%b\n' "$3" > "$1.ext"
+            openssl x509 -req -in "$1.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -out "$1.crt" -extfile "$1.ext"
+          }
+          sign server "/CN=localhost" "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth"
+          sign client "/CN=crystal_cert" "extendedKeyUsage=clientAuth"
+
+          container=${{ job.services.postgres.id }}
+          for file in ca.crt server.crt server.key; do
+            docker cp "$file" "$container:/var/lib/postgresql/$file"
+          done
+          docker exec "$container" sh -c '
+            chown postgres:postgres /var/lib/postgresql/ca.crt /var/lib/postgresql/server.crt /var/lib/postgresql/server.key
+            chmod 600 /var/lib/postgresql/server.key
+            sed -i "1i hostssl all crystal_cert all cert\nhostnossl all crystal_ssl_only all reject" "$PGDATA/pg_hba.conf"'
+          docker exec -u postgres "$container" psql -v ON_ERROR_STOP=1 \
+            -c "alter system set ssl_cert_file = '/var/lib/postgresql/server.crt'" \
+            -c "alter system set ssl_key_file = '/var/lib/postgresql/server.key'" \
+            -c "alter system set ssl_ca_file = '/var/lib/postgresql/ca.crt'" \
+            -c "alter system set ssl = on" \
+            -c "select pg_reload_conf()"
+
+          {
+            echo "SSL_ROOT_CERT=$dir/ca.crt"
+            echo "SSL_CLIENT_CERT=$dir/client.crt"
+            echo "SSL_CLIENT_KEY=$dir/client.key"
+          } >> "$GITHUB_ENV"
+
+      - name: Test TLS
+        env:
+          RUN_AUTH_SPECS: "1"
+        run: |
+          # pg_reload_conf only signals: wait until the server has read it
+          for _ in $(seq 50); do
+            [ "$(docker exec -u postgres ${{ job.services.postgres.id }} psql -tAc 'show ssl')" = on ] && break
+            sleep 0.2
+          done
+          iyi test pg/pq/ssl_test.iyi
+
+      # No "test from artifacts" step as iyi-db has: iyi 0.18.0 does not write
       # artifacts for a required package's modules (`--emit-iyimod` help,
       # SPEC.md III.7 step 5), so a build with `--use-iyimod` cannot find
       # iyi-db's.
