@@ -556,6 +556,9 @@ pub class NumericDecoder < Decoder
     weight = io.read_i16!
     sign = io.read_i16!
     dscale = io.read_i16!
+    if Numeric::Sign.from_value?(sign.to_i32).nil?
+      return RuntimeError.new("invalid numeric sign: 0x#{(sign.to_i32 & 0xFFFF).to_s(16)}")
+    end
     digits = [] of Int16
     ndigits.to_i32.times do
       digit = io.read_i16

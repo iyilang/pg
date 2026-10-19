@@ -129,7 +129,6 @@ pub class CopyResult
   def write(slice : Bytes) : Nil | DBError
     return DBError.new("Can't write to a read-only PG::CopyResult") if @reading
     @connection.send_copy_data_message(slice)
-    nil
   end
 
   def write(text : String) : Nil | DBError

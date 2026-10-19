@@ -98,8 +98,8 @@ end
 # crystal-pg's constructor spawned a keepalive fiber and a run-loop fiber.
 # An iyi task cannot outlive its group (SPEC.md III.4.1), so `#run` opens a
 # group of its own for the two, and `#start` runs that in a task of the
-# caller's group. Both tasks run on one thread and a write never parks
-# halfway through a message, so crystal-pg's write `Mutex` has no work here.
+# caller's group. Both write to the one `Stream`, whose `flush` sends a
+# message whole under a lock: crystal-pg's write `Mutex`.
 pub class Connection
   BASE_RECONNECT_BACKOFF = Span.seconds(1)
   MAX_RECONNECT_BACKOFF  = Span.seconds(30)

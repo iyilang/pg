@@ -224,8 +224,11 @@ pub class PQConnection
 
   private def read_one_frame(frame_type : Char) : Frame | DBError
     size = @stream.read_i32!
+    return StreamError.new("Malformed #{frame_type.inspect} message: a length of #{size}") if size < 4
     slice = @stream.read_bytes(size - 4)!
-    Frame.new(frame_type, slice)
+    frame = Frame.new(frame_type, slice)
+    return StreamError.new("Malformed #{frame_type.inspect} message: its body ends early") if frame.short?
+    frame
   end
 
   # `true` when *frame* was handled here and the caller reads the next one.
@@ -603,10 +606,14 @@ pub class PQConnection
     @stream.write_i32(4)
   end
 
-  def send_copy_data_message(slice : Bytes) : Nil
+  # One CopyData message; once a buffer's worth is waiting, it is sent, so a
+  # COPY FROM STDIN streams rather than collecting its whole input.
+  def send_copy_data_message(slice : Bytes) : Nil | DBError
     @stream.write_char('d')
     @stream.write_i32(4 + slice.size)
     @stream.write(slice)
+    @stream.flush! if @stream.pending >= Stream::BUFFER_SIZE
+    nil
   end
 
   def send_copy_done_message : Nil | DBError

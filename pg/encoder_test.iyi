@@ -4,8 +4,10 @@ module pg/encoder_test
 import std/int
 import std/float
 import std/time::{Time}
+import std/slice::{Slice, Bytes}
 import db/db/errors::*
 import db/db/value::{DBValue, CustomValue}
+import pg/record::{Record}
 import db/db/spec::{describe, it}
 import pg/interval::{Interval}
 import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
@@ -83,5 +85,39 @@ describe "PG::Driver encoder" do
       Point.new(1.2, 3.4),
       Point.new(5.6, 7.8),
     ])
+  end
+end
+
+describe "PG::Driver encoder, beyond crystal-pg" do
+  # crystal-pg #252: nine fractional digits, which the server rounded to
+  # the next day.
+  it "cuts a Time to microseconds rather than letting the server round it" do
+    last = Time.utc(2022, 5, 1, 23, 59, 59, nanosecond: 999_999_999)
+    day = PG_DB.query_one("select (($1::timestamptz) at time zone 'UTC')::date::text", last, as: String).or_panic
+    assert day == "2022-05-01", day
+    micros = PG_DB.query_one("select extract(microseconds from $1::timestamptz)::int8", last, as: Int64).or_panic
+    assert micros == 59_999_999_i64, micros.to_s
+  end
+
+  it "binds a Record with every character a composite field can hold" do
+    PG_DB.exec("drop type if exists encoder_rec").or_panic
+    PG_DB.exec("create type encoder_rec as (a text, b text, c text, d text, e bytea, f int4, g timestamp)").or_panic
+    record = Record.new([
+      "a,b (c)", %(say "hi" \\ bye), nil, "",
+      Bytes.new(2) { |i| (i * 255).to_u8 }, 7, Time.utc(2020, 1, 2, 3, 4, 5),
+    ] of DBValue)
+    json = PG_DB.query_one("select row_to_json($1::encoder_rec)::text", record, as: String).or_panic
+    assert json == %({"a":"a,b (c)","b":"say \\"hi\\" \\\\ bye","c":null,"d":"","e":"\\\\x00ff","f":7,"g":"2020-01-02T03:04:05"}), json
+    PG_DB.exec("drop type encoder_rec").or_panic
+  end
+
+  it "binds more than 32767 parameters, and refuses more than 65535" do
+    # every parameter named, or the server cannot type the ones that are not
+    args = Array(DBValue).new(40000) { |i| i }
+    sql = "select (array[#{(1..40000).map { |i| "$#{i}::int4" }.join(",")}])[40000]"
+    assert PG_DB.query_one(sql, args: args, as: Int32).or_panic == 39999
+    too_many = Array(DBValue).new(65536) { |i| i }
+    result = PG_DB.query_one("select $1::int4", args: too_many, as: Int32)
+    assert result.is_a?(DBError) && result.message.includes?("at most 65535"), result.to_s
   end
 end

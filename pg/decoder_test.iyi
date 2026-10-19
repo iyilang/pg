@@ -5,6 +5,7 @@ module pg/decoder_test
 import std/int
 import std/float
 import std/time::{Time}
+import std/big::{BigDecimal, BigRational}
 import std/slice::{Slice, Bytes}
 import std/uuid::{UUID}
 import db/db/errors::*

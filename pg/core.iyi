@@ -213,23 +213,30 @@ pub class PGResultSet < ResultSet
   end
 
   # A `numeric` column with every digit. crystal-pg's `pg_ext/big_decimal`.
+  # NaN and the infinities are refused: a `BigDecimal` holds neither.
   def read(t : BigDecimal.class) : BigDecimal | DBError
-    read(Numeric)!.to_big_d
+    finite(read(Numeric)!)!.to_big_d
   end
 
   def read(t : (BigDecimal | Nil).class) : BigDecimal | Nil | DBError
     value = read(Numeric | Nil)!
-    value.nil? ? nil : value.to_big_d
+    value.nil? ? nil : finite(value)!.to_big_d
   end
 
   # A `numeric` column with every digit. crystal-pg's `pg_ext/big_rational`.
+  # NaN and the infinities are refused, as for `BigDecimal`.
   def read(t : BigRational.class) : BigRational | DBError
-    read(Numeric)!.to_big_r
+    finite(read(Numeric)!)!.to_big_r
   end
 
   def read(t : (BigRational | Nil).class) : BigRational | Nil | DBError
     value = read(Numeric | Nil)!
-    value.nil? ? nil : value.to_big_r
+    value.nil? ? nil : finite(value)!.to_big_r
+  end
+
+  private def finite(value : Numeric) : Numeric | DBError
+    return RuntimeError.new("#{value} cannot be read as an exact number") if value.nan? || value.infinite?
+    value
   end
 
   def read(klass : T.class) : T | DBError forall T
@@ -253,7 +260,8 @@ pub class PGResultSet < ResultSet
 
   # Runs the decoding in the block over the next *col_bytesize* bytes, then
   # skips whatever it left of them - all of them when it failed - and moves
-  # to the next column.
+  # to the next column. A decoder that read past the column has taken the
+  # next one's bytes: the session is out of step, and is answered as lost.
   private def safe_read(col_bytesize : Int32, & : ByteSource -> U) : U | DBError forall U
     stream = @conn.stream
     start = stream.position
@@ -263,6 +271,8 @@ pub class PGResultSet < ResultSet
     if left > 0
       skipped = stream.skip(left)
       return skipped if skipped.is_a?(DBError)
+    elsif left < 0 && col_bytesize >= 0
+      return StreamError.new("The decoder of column #{@column_index - 1} read #{-left} bytes past it")
     end
     value
   end
@@ -370,9 +380,15 @@ pub class PGStatement < Statement
     )
   end
 
+  # The most parameters a Bind message counts (an unsigned 16-bit number).
+  MAX_PARAMETERS = 65535
+
   # Parses, binds and executes the statement with the extended query
   # protocol, and reads up to the description of its rows.
   private def start_query(args : Array(DBValue)) : PGResultSet | DBError
+    if args.size > MAX_PARAMETERS
+      return DBError.new("#{args.size} parameters: a statement takes at most #{MAX_PARAMETERS}")
+    end
     params = args.map { |arg| Param.encode(arg) }
     @conn.send_parse_message(command)
     @conn.send_bind_message(params)
@@ -495,11 +511,23 @@ pub class PGConnection < Connection
     group.spawn { @connection.start_replication_frame_loop(publication_name, slot_name, start_lsn, &block) }
   end
 
-  # The server's version, from its `server_version` parameter.
+  # The server's version, from its `server_version` parameter: each part's
+  # leading digits, as libpq reads them, so `16beta1` is 16 and `17devel`
+  # 17.
   def version : NamedTuple(major: Int32, minor: Int32, patch: Int32)
     text = (server_version || "0").partition(' ')[0]
-    vers = text.split('.').map { |part| part.to_i? || 0 }
+    vers = text.split('.').map { |part| PGConnection.leading_number(part) }
     {major: vers[0]? || 0, minor: vers[1]? || 0, patch: vers[2]? || 0}
+  end
+
+  # The number *part* starts with; 0 when it starts with none.
+  def self.leading_number(part : String) : Int32
+    number = 0
+    part.each_char do |char|
+      break unless char.ascii_number?
+      number = number * 10 + (char.ord - '0'.ord)
+    end
+    number
   end
 
   protected def do_close : Nil | DBError

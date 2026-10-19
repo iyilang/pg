@@ -8,8 +8,9 @@ import std/file
 import std/path::{Path}
 import std/text
 import std/uri::{URI, Params}
+import std/user::{User}
 import db/db/errors::{DBError, ArgumentError}
-import pg/pq/pgpass::{PgPass}
+import pg/pq/pgpass::{PgPass, LOG}
 
 pub struct ConnInfo
   SOCKET_SEARCH = ["/run/postgresql", "/tmp", "/var/run/postgresql"]
@@ -17,6 +18,15 @@ pub struct ConnInfo
   SUPPORTED_AUTH_METHODS = ["cleartext", "md5", "scram-sha-256", "scram-sha-256-plus"]
 
   SSL_MODES = [:disable, :allow, :prefer, :require, :"verify-ca", :"verify-full"]
+
+  # The keys a URI's query or a `key=value` string may hold besides the TLS
+  # and authentication ones `handle_sslparam` reads: the connection's own,
+  # and iyi-db's pool options. Any other is reported, not silently dropped.
+  KNOWN_KEYS = [
+    "host", "port", "dbname", "user", "password", "application_name", "replication",
+    "initial_pool_size", "max_pool_size", "max_idle_pool_size", "checkout_timeout",
+    "retry_attempts", "retry_delay", "prepared_statements", "prepared_statements_cache",
+  ]
 
   # The `ssl_min_protocol_version`s std/tls speaks.
   TLS_VERSIONS = ["TLSv1.2", "TLSv1.3"]
@@ -69,12 +79,15 @@ pub struct ConnInfo
 
   # A connection description from its parts; what is not given is taken from
   # the environment (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
-  # `PGPASSWORD`, `PGAPPNAME`) or the password file.
+  # `PGPASSWORD`, `PGAPPNAME`) or the password file. The database defaults
+  # to the user's name, as libpq's does. An `sslmode` not in `SSL_MODES` is
+  # a mistake in the program, and panics.
   def initialize(host : String? = nil, database : String? = nil, user : String? = nil, password : String? = nil, port : Int32? = nil, sslmode : Symbol = :prefer, application_name : String? = nil, @replication : String? = nil)
+    raise "unknown sslmode #{sslmode}: #{SSL_MODES.join(", ")}" unless SSL_MODES.includes?(sslmode)
     @port = port || ((ENV["PGPORT"]? || "").to_i? || 5432)
     @host = ConnInfo.default_host(host, @port)
-    @database = ConnInfo.default_database(database).lchop('/')
     @user = user || ENV["PGUSER"]? || ConnInfo.current_user_name
+    @database = ConnInfo.default_database(database, @user).lchop('/')
     @sslmode = sslmode
     @password = password || ENV["PGPASSWORD"]? || PgPass.locate(@host, @port, @database, @user)
     @application_name = application_name || ENV["PGAPPNAME"]? || "crystal"
@@ -99,7 +112,7 @@ pub struct ConnInfo
       return ArgumentError.new("invalid connection URI: #{conninfo}") if uri.nil?
       from_uri(uri)
     else
-      return ConnInfo.new if conninfo == ""
+      return from_hash({} of String => String) if conninfo == ""
 
       args = {} of String => String
       conninfo.split(' ').each do |pair|
@@ -119,7 +132,7 @@ pub struct ConnInfo
   def self.from_uri(uri : URI) : ConnInfo | DBError
     params = Params.parse(uri.query || "")
     hostname = (uri.hostname || "").presence || params["host"]? || ""
-    port = uri.port || parse_port(params["port"]?)!
+    port = uri.port || parse_port(params["port"]?)! || env_port!
     info = ConnInfo.new(hostname.presence, uri.path, uri.user, uri.password, port, :prefer, params["application_name"]?, params["replication"]?)
     params.each do |key, value|
       handled = info.handle_sslparam(key, value)
@@ -134,7 +147,7 @@ pub struct ConnInfo
   # `"sslrootcert"`, `"channel_binding"`, `"ssl_min_protocol_version"`,
   # `"application_name"`, `"replication"` and `"auth_methods"`.
   def self.from_hash(params : Hash(String, String)) : ConnInfo | DBError
-    port = parse_port(params["port"]?)!
+    port = parse_port(params["port"]?)! || env_port!
     info = ConnInfo.new(params["host"]?, params["dbname"]?, params["user"]?,
       params["password"]?, port, :prefer, params["application_name"]?, params["replication"]?)
     params.each do |key, value|
@@ -181,6 +194,14 @@ pub struct ConnInfo
     port.to_i? || ArgumentError.new("invalid port: #{port}")
   end
 
+  # `PGPORT`'s port, nil when it is unset, and an error when it is not a
+  # number rather than the default port in its place.
+  protected def self.env_port : Int32? | DBError
+    value = ENV["PGPORT"]?
+    return nil if value.nil? || value.empty?
+    value.to_i? || ArgumentError.new("invalid PGPORT: #{value}")
+  end
+
   protected def handle_sslparam(key : String, value : String) : Nil | DBError
     case key
     when "sslmode"
@@ -208,7 +229,7 @@ pub struct ConnInfo
       end
       @auth_methods = methods
     else
-      # ignore
+      LOG.warn { "Ignoring the connection parameter #{key}, which this driver does not support" } unless KNOWN_KEYS.includes?(key)
     end
     nil
   end
@@ -231,21 +252,25 @@ pub struct ConnInfo
     "localhost"
   end
 
-  protected def self.default_database(db : String?) : String
+  protected def self.default_database(db : String?, user : String) : String
     if db && db != "/" && !db.empty?
       db
     else
-      ENV["PGDATABASE"]? || current_user_name
+      ENV["PGDATABASE"]? || user
     end
   end
 
-  # The login name, the default user and database. Windows has no answer
-  # here and says "postgres", as crystal-pg does.
+  # The name of the account the program runs as, the default user, as libpq
+  # looks it up by the real user id; "postgres" when the system has no
+  # account for it and `$USER` names none. `User.current` panics then, and a
+  # panic is caught only at a task's edge, so the lookup runs as a task.
   def self.current_user_name : String
-    {% if flag?(:win32) %}
-      "postgres"
-    {% else %}
-      ENV["USER"]? || ENV["LOGNAME"]? || "postgres"
-    {% end %}
+    name = "postgres"
+    group do |g|
+      task = g.spawn { User.current.name }
+      found = task.value
+      name = found if found.is_a?(String) && !found.empty?
+    end
+    name
   end
 end

@@ -78,6 +78,22 @@ describe "PQ::PgPass.parsing" do
         end
       end
     end
+
+    it "passes over a pgpass file it cannot read, where reading it panicked" do
+      env_var_bubble do
+        create_valid_pgpass_file do |filename|
+          File.chmod(filename, 0o0000)
+          ENV["PGPASSFILE"] = filename
+          if File.readable?(filename)
+            puts "pg/pq/pgpass_test: #{filename} is readable at mode 0000 (root?); skipped"
+          else
+            backend = capture_pg_log { assert password_for("postgres://user@host:1/database").nil?; nil }
+            check_single_warning(backend, "Cannot read pgpass file #{filename}")
+          end
+          File.chmod(filename, 0o0600)
+        end
+      end
+    end
   {% end %}
 
   it "gracefully handles an inproper pgpass file" do

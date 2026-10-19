@@ -11,7 +11,7 @@ import db/db/core::{ResultSet, Transaction}
 import db/db/serializable::{db_serializable}
 import db/db/spec::{describe, it, expect_error}
 import pg/pq/errors::{PQError}
-import pg/core::{PGDriver}
+import pg/core::{PGDriver, PGConnection}
 import pg/testing/spec_helper::*
 
 def assert_single_read(rs : ResultSet, value_type : T.class, value : V) : Nil forall T, V
@@ -34,6 +34,14 @@ end
 describe "PG::Driver" do
   it "should register postgres name" do
     assert ::Db.driver_class("postgres").or_panic == PGDriver
+  end
+
+  it "reads a pre-release server's version by its leading digits" do
+    assert PGConnection.leading_number("16beta1") == 16
+    assert PGConnection.leading_number("17devel") == 17
+    assert PGConnection.leading_number("18rc1") == 18
+    assert PGConnection.leading_number("4") == 4
+    assert PGConnection.leading_number("devel") == 0
   end
 
   it "exectes and selects value" do

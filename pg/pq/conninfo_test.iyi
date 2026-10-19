@@ -2,9 +2,11 @@
 module pg/pq/conninfo_test
 
 import std/env
+import std/log::{MemoryBackend, Severity}
 import db/db/errors::*
 import db/db/spec::{describe, it, expect_error}
 import pg/pq/conninfo::{ConnInfo}
+import pg/pq/pgpass::{LOG}
 import pg/testing/spec_helper::{env_var_bubble}
 
 def assert_default_params(ci : ConnInfo) : Nil
@@ -132,5 +134,36 @@ describe "PQ::ConnInfo.from_conninfo_string" do
       ENV["PGHOST"] = "/path"
       assert parse("postgres://").host == "/path"
     end
+  end
+
+  it "refuses a PGPORT that is not a number rather than using 5432" do
+    env_var_bubble do
+      ENV["PGPORT"] = "54x2"
+      expect_error(ConnInfo.from_conninfo_string("postgres://host/db"), ArgumentError)
+      expect_error(ConnInfo.from_conninfo_string("host=host"), ArgumentError)
+      assert parse("postgres://host:5433/db").port == 5433
+    end
+  end
+
+  it "defaults the database to the user, PGUSER's included, as libpq does" do
+    env_var_bubble do
+      ENV["PGUSER"] = "someone"
+      assert parse("postgres://host").database == "someone"
+    end
+    env_var_bubble do
+      ci = parse("postgres://host")
+      assert !ci.user.empty?
+      assert ci.database == ci.user
+    end
+  end
+
+  it "reports a parameter it ignores, and not iyi-db's pool options" do
+    backend = MemoryBackend.new
+    previous = LOG.own_backend
+    LOG.backend = backend
+    parse("postgres://host/db?sslmdoe=verify-full&max_pool_size=2&application_name=x")
+    LOG.backend = previous
+    warnings = backend.entries.select { |e| e.severity >= Severity::Warn }.map(&.message)
+    assert warnings == ["Ignoring the connection parameter sslmdoe, which this driver does not support"], warnings.inspect
   end
 end

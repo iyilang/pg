@@ -94,14 +94,10 @@ pub class SaslContext
     @server_sig = nil
   end
 
-  # Eighteen random bytes, URL-safe base64: what crystal-pg sent. The
-  # generator is seeded from the platform's entropy.
+  # Eighteen bytes of the platform's entropy (`Random::Secure`), URL-safe
+  # base64, as crystal-pg sends: RFC 5802 asks that no one can guess it.
   def self.nonce : String
-    random = Random.new
-    raw = String.new(18) do |buffer|
-      18.times { |i| buffer[i] = (random.next_u & 0xFF_u32).to_u8 }
-    end
-    Base64.urlsafe_encode(raw)
+    Random::Secure.urlsafe_base64(18)
   end
 
   # The client-final-message for the server-first-message *body*.

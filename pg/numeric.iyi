@@ -1,4 +1,5 @@
-# PostgreSQL's `numeric`: arbitrary precision, and possibly NaN.
+# PostgreSQL's `numeric`: arbitrary precision, and possibly NaN or, from
+# PostgreSQL 14, ±Infinity.
 module pg/numeric
 
 import std/int
@@ -7,17 +8,20 @@ import std/big::{BigDecimal, BigInt, BigRational}
 import db/db/value::{CustomValue}
 
 # The Postgres numeric type has arbitrary precision, and can be NaN, "not a
-# number".
+# number", or (PostgreSQL 14 and later) `Infinity` or `-Infinity`.
 #
 # `#to_f` is an approximate conversion; `#to_big_d` and `#to_big_r` keep
 # every digit. crystal-pg had those two in the optional `pg_ext` files
 # because Crystal's big numbers need LibGMP; iyi's do not, so they are here.
 pub class Numeric < CustomValue
-  # :nodoc:
+  # The sign word as the server sends it, read as an Int16: NaN is 0xC000,
+  # Infinity 0xD000 and -Infinity 0xF000.
   enum Sign
-    Pos =  0x0000
-    Neg =  0x4000
-    Nan = -0x4000
+    Pos  =  0x0000
+    Neg  =  0x4000
+    Nan  = -0x4000
+    Pinf = -0x3000
+    Ninf = -0x1000
   end
 
   # size of digits array
@@ -27,7 +31,7 @@ pub class Numeric < CustomValue
   # can be negative for small numbers such as 0.0000001
   getter weight : Int16
 
-  # positive, negative, or nan
+  # positive, negative, nan, or an infinity
   getter sign : Sign
 
   # number of decimal point digits shown
@@ -47,9 +51,14 @@ pub class Numeric < CustomValue
     sign == Sign::Nan
   end
 
-  # Returns `true` if the numeric is negative.
+  # Returns `true` if the numeric is `Infinity` or `-Infinity`.
+  def infinite? : Bool
+    sign == Sign::Pinf || sign == Sign::Ninf
+  end
+
+  # Returns `true` if the numeric is negative, `-Infinity` included.
   def neg? : Bool
-    sign == Sign::Neg
+    sign == Sign::Neg || sign == Sign::Ninf
   end
 
   def ==(other : Numeric) : Bool
@@ -64,7 +73,8 @@ pub class Numeric < CustomValue
   # The approximate representation of the numeric as a 64-bit float.
   #
   # Very small and very large values may be inaccurate and precision will be
-  # lost; `#to_big_d` and `#to_big_r` keep it. NaN returns NaN.
+  # lost; `#to_big_d` and `#to_big_r` keep it. NaN returns NaN, and the
+  # infinities the float ones.
   def to_f : Float64
     to_f64
   end
@@ -72,6 +82,7 @@ pub class Numeric < CustomValue
   # ditto
   def to_f64 : Float64
     return Float64::NAN if nan?
+    return neg? ? -Float64::INFINITY : Float64::INFINITY if infinite?
     # reverse and add the smaller digits first to try and not lose as much precision
     num = 0_f64
     index = 0
@@ -84,9 +95,11 @@ pub class Numeric < CustomValue
     neg? ? -quot : quot
   end
 
-  # A `BigDecimal` with every digit of the numeric; zero for NaN.
+  # A `BigDecimal` with every digit of the numeric; zero for NaN and the
+  # infinities, which it cannot hold (`ResultSet#read(BigDecimal)` refuses
+  # them).
   def to_big_d : BigDecimal
-    return BigDecimal.new(0, 0) if nan? || ndigits == 0
+    return BigDecimal.new(0, 0) if nan? || infinite? || ndigits == 0
 
     num = big_digits
     scale = 4 * (ndigits.to_i32 - 1 - weight.to_i32)
@@ -94,9 +107,11 @@ pub class Numeric < CustomValue
     neg? ? -quot : quot
   end
 
-  # A `BigRational` with every digit of the numeric; zero for NaN.
+  # A `BigRational` with every digit of the numeric; zero for NaN and the
+  # infinities, which it cannot hold (`ResultSet#read(BigRational)` refuses
+  # them).
   def to_big_r : BigRational
-    return BigRational.new(0, 1) if nan? || ndigits == 0
+    return BigRational.new(0, 1) if nan? || infinite? || ndigits == 0
 
     num = big_digits
     exponent = ndigits.to_i32 - 1 - weight.to_i32
@@ -128,6 +143,10 @@ pub class Numeric < CustomValue
   end
 
   private def write_to(io : String::Builder) : Nil
+    if infinite?
+      io << (neg? ? "-Infinity" : "Infinity")
+      return
+    end
     if ndigits == 0
       if nan?
         io << "NaN"

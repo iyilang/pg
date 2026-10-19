@@ -76,8 +76,10 @@ pub abstract class ByteSource
     pointerof(bits).as(Float64*).value
   end
 
-  # *count* bytes, newly allocated.
+  # *count* bytes, newly allocated. A negative count is a length no
+  # well-formed message carries.
   def read_bytes(count : Int32) : Bytes | StreamError
+    return StreamError.new("Malformed message: a length of #{count}") if count < 0
     slice = Bytes.new(count)
     read_fully(slice)!
     slice
@@ -85,6 +87,7 @@ pub abstract class ByteSource
 
   # *count* bytes as a string.
   def read_string(count : Int32) : String | StreamError
+    return StreamError.new("Malformed message: a length of #{count}") if count < 0
     failed = nil.as(StreamError?)
     text = String.new(count) do |buffer|
       result = read_fully(buffer, count)
@@ -144,10 +147,18 @@ pub class Stream < ByteSource
   @base = 0_i64
   @wbuf : Bytes
   @wlen = 0
+  # The buffer `flush` swaps in while it sends the other.
+  @spare : Bytes
+  # One token: the task that takes it sends. A Channel rather than a
+  # `Mutex`, whose block may not touch the stream itself.
+  @send_lock : Channel(Nil)
 
   def initialize(@socket : IyiSocket)
     @rbuf = Bytes.new(BUFFER_SIZE)
     @wbuf = Bytes.new(BUFFER_SIZE)
+    @spare = Bytes.new(BUFFER_SIZE)
+    @send_lock = Channel(Nil).new(1)
+    @send_lock.put_now(nil)
   end
 
   def socket : IyiSocket
@@ -354,19 +365,39 @@ pub class Stream < ByteSource
     write(text.to_unsafe, text.bytesize)
   end
 
-  # Sends what was written.
+  # How many bytes are written and not yet flushed.
+  def pending : Int32
+    @wlen
+  end
+
+  # Sends what was written. The buffer is swapped for the spare one before
+  # the send, and the send holds the lock, so a task that writes and flushes
+  # while another's send waits on the socket (a replication keepalive beside
+  # the run loop's) neither sends those bytes again nor interleaves its own
+  # with them. A buffer grown past `BUFFER_SIZE` for a large message is let
+  # go after its send, not kept for the connection's life.
   def flush : Nil | StreamError
     return nil if @wlen == 0
     return StreamError.new("Socket is closed") if closed?
+    taken = @send_lock.receive
+    return StreamError.new("Socket write was cancelled") unless taken.nil?
+    data = @wbuf
+    size = @wlen
+    @wbuf = @spare
+    @wlen = 0
+    result = send(data, size)
+    @spare = data.size > BUFFER_SIZE ? Bytes.new(BUFFER_SIZE) : data
+    @send_lock.put_now(nil)
+    result
+  end
+
+  private def send(data : Bytes, size : Int32) : StreamError?
     if tls = @tls
-      size = @wlen
-      @wlen = 0
-      sent = tls.write(String.new(size) { |buffer| buffer.copy_from(@wbuf.to_unsafe, size) })
+      sent = tls.write(String.new(size) { |buffer| buffer.copy_from(data.to_unsafe, size) })
       return StreamError.new("TLS error: #{sent.message}") if sent.is_a?(TlsError)
       return nil
     end
-    n = @socket.write(@wbuf.to_unsafe, @wlen)
-    @wlen = 0
+    n = @socket.write(data.to_unsafe, size)
     case n
     when Int32
       nil

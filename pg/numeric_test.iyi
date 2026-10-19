@@ -163,4 +163,17 @@ describe "PG::Numeric" do
     assert !ex("1").nan?
     assert !ex("-1").nan?
   end
+
+  # PostgreSQL 14's infinities: sign words 0xD000 and 0xF000.
+  it "infinities" do
+    inf = n(0, 0, -0x3000, 0, [] of Int32)
+    ninf = n(0, 0, -0x1000, 0, [] of Int32)
+    assert inf.infinite? && !inf.neg? && !inf.nan?
+    assert ninf.infinite? && ninf.neg?
+    assert inf.to_s == "Infinity", inf.to_s
+    assert ninf.to_s == "-Infinity", ninf.to_s
+    assert inf.to_f == Float64::INFINITY
+    assert ninf.to_f == -Float64::INFINITY
+    assert !ex("1").infinite?
+  end
 end

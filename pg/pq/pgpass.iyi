@@ -1,4 +1,5 @@
-# The password file: `~/.pgpass`, or the file `PGPASSFILE` names.
+# The password file: `~/.pgpass` (`%APPDATA%\postgresql\pgpass.conf` on
+# Windows), or the file `PGPASSFILE` names.
 #
 # https://www.postgresql.org/docs/current/libpq-pgpass.html
 module pg/pq/pgpass
@@ -15,10 +16,15 @@ pub LOG = Log.for("pg")
 pub class PgPass
   # The password the file holds for *host*, *port*, *db* and *user*, or nil.
   def self.locate(host : String, port : Int32, db : String, user : String) : String?
-    filename = ENV["PGPASSFILE"]? || Path["~/.pgpass"].expand(home: true).to_s
+    filename = ENV["PGPASSFILE"]? || default_file
+    return nil if filename.nil?
 
     unless File.exists?(filename) && File.file?(filename)
       LOG.debug { "No pgpass file available" }
+      return nil
+    end
+    unless File.readable?(filename)
+      LOG.warn { "Cannot read pgpass file #{filename}" }
       return nil
     end
 
@@ -46,5 +52,16 @@ pub class PgPass
       return fields[4]
     end
     nil
+  end
+
+  # libpq's: `~/.pgpass`, or `%APPDATA%\postgresql\pgpass.conf` on Windows.
+  def self.default_file : String?
+    {% if flag?(:win32) %}
+      if appdata = ENV["APPDATA"]?
+        File.join(appdata, "postgresql", "pgpass.conf")
+      end
+    {% else %}
+      Path["~/.pgpass"].expand(home: true).to_s
+    {% end %}
   end
 end

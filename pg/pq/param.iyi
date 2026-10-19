@@ -10,8 +10,11 @@ import std/slice::{Slice, Bytes}
 import db/db/value::{DBValue, CustomValue}
 import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
 import pg/interval::{Interval}
+import pg/record::{Record}
 
 pub struct Param
+  HEX = "0123456789abcdef"
+
   getter slice : Bytes
   getter size : Int32
   getter format : Int16
@@ -28,40 +31,57 @@ pub struct Param
       binary(Bytes.empty, -1)
     when Bytes
       binary(val, val.size)
-    when Array
-      text(encode_array(val))
-    when Time
-      text(val.to_rfc3339(9))
-    when Point
-      text("(#{val.x},#{val.y})")
-    when Line
-      text("{#{val.a},#{val.b},#{val.c}}")
-    when Circle
-      text("<(#{val.x},#{val.y}),#{val.radius}>")
-    when LineSegment
-      text("((#{val.x1},#{val.y1}),(#{val.x2},#{val.y2}))")
-    when Box
-      text("((#{val.x1},#{val.y1}),(#{val.x2},#{val.y2}))")
-    when Path
-      if val.closed?
-        encode_points("(", val.points, ")")
-      else
-        encode_points("[", val.points, "]")
-      end
-    when Polygon
-      encode_points("(", val.points, ")")
-    when Interval
-      # https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-INTERVAL-INPUT
-      text("#{val.months} months #{val.days} days #{val.microseconds} microseconds")
-    when Span
-      text("#{val.total_seconds_i64} seconds #{val.nanoseconds // 1000} microseconds")
     else
-      text(val.to_s)
+      text(text_form(val))
     end
   end
 
-  private def self.encode_points(left : String, points : Array(Point), right : String) : Param
-    string = String.build do |io|
+  # *value* in the text form the server reads for its type: what a text
+  # parameter carries, and what an array element or a composite field holds
+  # before it is quoted.
+  def self.text_form(value : DBValue) : String
+    case value
+    when Nil
+      ""
+    when Bytes
+      String.build(2 + 2 * value.size) do |io|
+        io << "\\x"
+        write_hex(io, value)
+      end
+    when Array
+      encode_array(value)
+    when Time
+      # Microseconds, PostgreSQL's precision, cut rather than rounded: the
+      # server would round 23:59:59.999999999 into the next day.
+      value.to_rfc3339(6)
+    when Record
+      encode_record(value)
+    when Point
+      "(#{value.x},#{value.y})"
+    when Line
+      "{#{value.a},#{value.b},#{value.c}}"
+    when Circle
+      "<(#{value.x},#{value.y}),#{value.radius}>"
+    when LineSegment
+      "((#{value.x1},#{value.y1}),(#{value.x2},#{value.y2}))"
+    when Box
+      "((#{value.x1},#{value.y1}),(#{value.x2},#{value.y2}))"
+    when Path
+      value.closed? ? encode_points("(", value.points, ")") : encode_points("[", value.points, "]")
+    when Polygon
+      encode_points("(", value.points, ")")
+    when Interval
+      # https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-INTERVAL-INPUT
+      "#{value.months} months #{value.days} days #{value.microseconds} microseconds"
+    when Span
+      "#{value.total_seconds_i64} seconds #{value.nanoseconds // 1000} microseconds"
+    else
+      value.to_s
+    end
+  end
+
+  private def self.encode_points(left : String, points : Array(Point), right : String) : String
+    String.build do |io|
       io << left
       points.each_with_index do |point, i|
         io << "," if i > 0
@@ -69,8 +89,20 @@ pub struct Param
       end
       io << right
     end
+  end
 
-    text(string)
+  # The composite literal of *record*: `(1,"a b",)`, a NULL field empty and
+  # every other one quoted, so commas, parentheses, quotes, backslashes,
+  # spaces and empty strings come through as they are.
+  def self.encode_record(record : Record) : String
+    String.build do |io|
+      io << '('
+      record.data.each_with_index do |field, index|
+        io << ',' if index > 0
+        encode_string(io, text_form(field)) unless field.nil?
+      end
+      io << ')'
+    end
   end
 
   def self.binary(slice : Bytes, size : Int32) : Param
@@ -103,22 +135,26 @@ pub struct Param
       io << (value ? 't' : 'f')
     when Bytes
       io << %{"\\\\x}
-      value.each_with_index do |byte, _|
-        io << byte.to_s(16).rjust(2, '0')
-      end
+      write_hex(io, value)
       io << '"'
     when String
       encode_string(io, value)
-    when Time
-      encode_string(io, value.to_rfc3339(9))
-    when CustomValue
-      encode_string(io, value.to_s)
+    when Time, CustomValue
+      encode_string(io, text_form(value))
     else
       io << value.to_s
     end
   end
 
-  # A double-quoted array element, `"` and `\` escaped by a backslash.
+  private def self.write_hex(io : String::Builder, bytes : Bytes) : Nil
+    digits = HEX.to_unsafe
+    bytes.each do |byte|
+      io << digits[byte >> 4].unsafe_chr << digits[byte & 0x0F].unsafe_chr
+    end
+  end
+
+  # A double-quoted array element or composite field, `"` and `\` escaped
+  # by a backslash.
   private def self.encode_string(io : String::Builder, value : String) : Nil
     io << '"'
     value.each_char do |char|

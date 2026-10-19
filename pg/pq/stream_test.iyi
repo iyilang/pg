@@ -1,0 +1,94 @@
+# The protocol layer over a socket pair, with no server: what it makes of
+# malformed messages, and of two tasks sending on one stream.
+module pg/pq/stream_test
+
+import std/socket::{IyiSocket}
+import std/slice::{Slice, Bytes}
+import db/db/errors::{DBError}
+import db/db/spec::{describe, it}
+import pg/pq/errors::{StreamError}
+import pg/pq/stream::{Stream}
+import pg/pq/conninfo::{ConnInfo}
+import pg/pq/connection::{PQConnection}
+# db/db/spec only type-checks with a driver loaded.
+import pg/core::{PGConnection}
+
+# A connected client and server socket.
+def socket_pair(& : IyiSocket, IyiSocket -> Nil) : Nil
+  listener = IyiSocket.listen("127.0.0.1", 0)
+  client = IyiSocket.connect("127.0.0.1", listener.local_port).as(IyiSocket)
+  server = listener.accept.as(IyiSocket)
+  yield client, server
+  client.close
+  server.close
+  listener.close
+end
+
+# What the client makes of *bytes* sent as the server's next message.
+def read_message(bytes : Array(UInt8)) : String
+  answer = ""
+  socket_pair do |client, server|
+    server.write(String.new(bytes.size) { |b| bytes.each_with_index { |byte, i| b[i] = byte } })
+    pq = PQConnection.new(Stream.new(client), ConnInfo.new("127.0.0.1", "db", "user", "pass", 1))
+    frame = pq.read
+    answer = frame.is_a?(StreamError) ? "StreamError: #{frame.message}" : frame.to_s
+  end
+  answer
+end
+
+describe "PQ::Connection, a malformed message" do
+  it "is a StreamError, not a panic" do
+    # a length under the four bytes of the length itself
+    got = read_message(['Z'.ord.to_u8, 0_u8, 0_u8, 0_u8, 3_u8])
+    assert got == "StreamError: Malformed 'Z' message: a length of 3", got
+    # BackendKeyData with half its body
+    got = read_message(['K'.ord.to_u8, 0_u8, 0_u8, 0_u8, 8_u8, 0_u8, 0_u8, 0_u8, 1_u8])
+    assert got == "StreamError: Malformed 'K' message: its body ends early", got
+    # Authentication with two of its type's four bytes
+    got = read_message(['R'.ord.to_u8, 0_u8, 0_u8, 0_u8, 6_u8, 0_u8, 0_u8])
+    assert got == "StreamError: Malformed 'R' message: its body ends early", got
+    # a command tag with no NUL
+    got = read_message(['C'.ord.to_u8, 0_u8, 0_u8, 0_u8, 7_u8, 'S'.ord.to_u8, 'E'.ord.to_u8, 'L'.ord.to_u8])
+    assert got == "StreamError: Malformed 'C' message: its body ends early", got
+    # and a well-formed one still reads
+    got = read_message(['Z'.ord.to_u8, 0_u8, 0_u8, 0_u8, 5_u8, 'I'.ord.to_u8])
+    assert got.includes?("ReadyForQuery"), got
+  end
+end
+
+describe "PQ::Stream#flush" do
+  # A big send that waits on the socket, and a small one from another task
+  # meanwhile: each goes out once, whole, in order. The small one used to
+  # send the big one's bytes again, which were still in the buffer.
+  it "sends each task's message once, whole, while another's send waits" do
+    big = 16 * 1024 * 1024
+    small = "the second message"
+    socket_pair do |client, server|
+      stream = Stream.new(client)
+      received = Bytes.new(0)
+      group do |g|
+        g.spawn do
+          stream.write(Bytes.new(big, 'a'.ord.to_u8))
+          stream.flush.or_panic
+          0
+        end
+        g.spawn do
+          sleep(20)
+          stream.write(small)
+          stream.flush.or_panic
+          0
+        end
+        g.spawn do
+          sleep(100)
+          received = Stream.new(server).read_bytes(big + small.bytesize).or_panic
+          0
+        end
+      end
+      assert received.size == big + small.bytesize
+      assert received[0, big].all? { |byte| byte == 'a'.ord.to_u8 }
+      tail = String.new(small.bytesize) { |b| b.copy_from(received.to_unsafe + big, small.bytesize) }
+      assert tail == small, tail
+      assert stream.pending == 0
+    end
+  end
+end

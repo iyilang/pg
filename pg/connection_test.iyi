@@ -8,6 +8,7 @@ import db/db/errors::*
 import db/db/spec::{describe, it, expect_error}
 import pg/pq/frame::{Notice, Notification}
 import pg/core::{PGConnection}
+import pg/pq/stream::{Stream}
 import pg
 import pg/testing/spec_helper::*
 
@@ -216,6 +217,25 @@ describe "PG COPY" do
       assert read == data, read.inspect
 
       db.exec("DROP TABLE copy_test").or_panic
+    end
+  end
+
+  it "streams a COPY FROM STDIN instead of collecting it" do
+    with_connection do |db|
+      db.exec("CREATE TEMPORARY TABLE copy_big (b text)").or_panic
+      line = "#{"x" * 9999}\n"
+      stream = db.connection.stream
+      wr = db.exec_copy("COPY copy_big FROM STDIN").or_panic
+      most = 0
+      500.times do
+        (wr << line).or_panic
+        most = stream.pending if stream.pending > most
+      end
+      wr.close.or_panic
+      # 5 MB went out; at most a buffer's worth and one line waited at once
+      assert most < Stream::BUFFER_SIZE + line.bytesize, most.to_s
+      assert db.scalar("select count(*) from copy_big where length(b) = 9999").or_panic == 500_i64
+      db.exec("DROP TABLE copy_big").or_panic
     end
   end
 end

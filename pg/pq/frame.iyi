@@ -101,6 +101,14 @@ pub abstract class Frame
   def initialize(bytes : Bytes)
   end
 
+  # Whether the body was shorter than its fields: a malformed message, which
+  # `PQConnection` answers as a `StreamError` rather than reading past it.
+  @short : Bool = false
+
+  def short? : Bool
+    @short
+  end
+
   def to_s : String
     self.class.to_s
   end
@@ -111,10 +119,18 @@ pub abstract class Frame
     while pos < bytes.size && bytes[pos] != 0_u8
       pos += 1
     end
+    if pos >= bytes.size
+      @short = true
+      return {bytes.size, ""}
+    end
     {pos + 1, Frame.string_of(bytes, start, pos - start)}
   end
 
   protected def i32(pos : Int32, bytes : Bytes) : Tuple(Int32, Int32)
+    if pos + 4 > bytes.size
+      @short = true
+      return {bytes.size, 0}
+    end
     {pos + 4, (bytes[pos + 3].to_i32) |
       (bytes[pos + 2].to_i32 << 8) |
       (bytes[pos + 1].to_i32 << 16) |
@@ -122,6 +138,10 @@ pub abstract class Frame
   end
 
   protected def i16(pos : Int32, bytes : Bytes) : Tuple(Int32, Int16)
+    if pos + 2 > bytes.size
+      @short = true
+      return {bytes.size, 0_i16}
+    end
     v = (bytes[pos].to_i32 << 8) | bytes[pos + 1].to_i32
     {pos + 2, (v >= 32768 ? v - 65536 : v).to_i16}
   end
@@ -182,7 +202,8 @@ pub abstract class Frame
     def initialize(bytes : Bytes)
       pos, key = find_next_string(0, bytes)
       @key = key
-      @value = Frame.string_of(bytes, pos, bytes.size - pos - 1)
+      pos, value = find_next_string(pos, bytes)
+      @value = value
     end
   end
 
@@ -203,7 +224,8 @@ pub abstract class Frame
     getter transaction_status : Char
 
     def initialize(bytes : Bytes)
-      @transaction_status = bytes[0].unsafe_chr
+      @short = bytes.empty?
+      @transaction_status = bytes.empty? ? 'I' : bytes[0].unsafe_chr
     end
   end
 
@@ -219,6 +241,7 @@ pub abstract class Frame
         break if code == 0_u8
         pos += 1
         pos, message = find_next_string(pos, bytes)
+        break if short?
         @fields << ErrorField.new(ErrorNoticeFrame.name_from_code(code), message, code)
       end
     end
@@ -314,6 +337,7 @@ pub abstract class Frame
     getter bytes : Bytes
 
     def initialize(@bytes : Bytes)
+      @short = @bytes.empty? || @bytes[@bytes.size - 1] != 0_u8
     end
 
     # The command tag: `INSERT 0 1`, `SELECT 3`, ...
