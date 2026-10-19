@@ -1,0 +1,175 @@
+# The types crystal-pg read as bytes: time, timetz, inet, cidr, macaddr,
+# macaddr8, money, bit, varbit, and the arrays of every decoded type.
+module pg/types_test
+
+import std/int
+import std/float
+import std/time::{Time, Span}
+import std/slice::{Slice, Bytes}
+import std/netip::{IP, Prefix}
+import db/db/errors::*
+import db/db/value::{DBValue, CustomValue}
+import db/db/spec::{describe, it}
+import pg/decoder::{JSONValue}
+import pg/interval::{Interval}
+import pg/record::{Record}
+import pg/time_tz::{TimeTz}
+import pg/inet::{Inet}
+import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
+import pg/testing/spec_helper::*
+
+def same?(a : DBValue, b : DBValue) : Bool
+  if a.is_a?(Array(DBValue)) && b.is_a?(Array(DBValue))
+    return false unless a.size == b.size
+    a.each_with_index { |x, i| return false unless same?(x, b[i]) }
+    return true
+  end
+  a.class == b.class && a == b
+end
+
+def test_decode(name : String, query : String, expected : DBValue) : Nil
+  it name do
+    value = PG_DB.query_one("select #{query}") { |rs| rs.read }.or_panic
+    assert same?(value, expected), "#{query}: expected #{expected.inspect}, got #{value.inspect}"
+  end
+end
+
+def test_insert_and_read(datatype : String, value : T) : Nil forall T
+  it "inserts #{datatype} #{value}" do
+    PG_DB.exec("drop table if exists test_table").or_panic
+    PG_DB.exec("create table test_table (v #{datatype})").or_panic
+    PG_DB.exec("insert into test_table values ($1)", args: [value]).or_panic
+    actual = PG_DB.query_one("select v from test_table", as: T).or_panic
+    assert actual == value, "#{datatype}: expected #{value.inspect}, got #{actual.inspect}"
+  end
+end
+
+def ip(text : String) : IP
+  IP.parse(text).as(IP)
+end
+
+def inet(text : String, length : Int32, cidr : Bool = false) : Inet
+  Inet.new(Prefix.new(ip(text), length), cidr)
+end
+
+def span(hours : Int64, minutes : Int64, seconds : Int64, micros : Int64 = 0_i64) : Span
+  Span.new(hours: hours, minutes: minutes, seconds: seconds, nanoseconds: micros * 1000)
+end
+
+def bytes(values : Array(UInt8)) : Bytes
+  slice = Bytes.new(values.size)
+  values.each_with_index { |v, i| slice[i] = v }
+  slice
+end
+
+describe "PG::Decoders new scalars" do
+  test_decode "time", "'12:34:56.789'::time", span(12, 34, 56, 789_000)
+  test_decode "time 24:00", "'24:00'::time", span(24, 0, 0)
+  test_decode "timetz", "'12:34:56.789+03'::timetz", TimeTz.new(span(12, 34, 56, 789_000), 3 * 3600)
+  test_decode "timetz west", "'01:02:03-05:30'::timetz", TimeTz.new(span(1, 2, 3), -(5 * 3600 + 30 * 60))
+  test_decode "inet v4 host", "'192.168.1.5'::inet", inet("192.168.1.5", 32)
+  test_decode "inet v4 net", "'192.168.1.5/24'::inet", inet("192.168.1.5", 24)
+  test_decode "inet v6", "'2001:db8::1'::inet", inet("2001:db8::1", 128)
+  test_decode "cidr v4", "'10.0.0.0/8'::cidr", inet("10.0.0.0", 8, true)
+  test_decode "cidr v6", "'2001:db8::/32'::cidr", inet("2001:db8::", 32, true)
+  test_decode "macaddr", "'08:00:2b:01:02:03'::macaddr", "08:00:2b:01:02:03"
+  test_decode "macaddr8", "'08:00:2b:01:02:03:04:05'::macaddr8", "08:00:2b:01:02:03:04:05"
+  test_decode "money", "'12.34'::money", 1234_i64
+  test_decode "money negative", "'-0.05'::money", -5_i64
+  test_decode "bit", "B'101'::bit(3)", "101"
+  test_decode "varbit", "B'1100110011'::varbit", "1100110011"
+  test_decode "varbit empty", "B''::varbit", ""
+
+  it "prints timetz as PostgreSQL does" do
+    assert TimeTz.new(span(12, 34, 56, 789_000), 3 * 3600).to_s == "12:34:56.789+03"
+    assert TimeTz.new(span(1, 2, 3), -(5 * 3600 + 30 * 60)).to_s == "01:02:03-05:30"
+    assert TimeTz.new(span(0, 0, 0), 0).to_s == "00:00:00+00"
+  end
+
+  it "prints inet and cidr as PostgreSQL does" do
+    {"'192.168.1.5'::inet", "'192.168.1.5/24'::inet", "'::1'::inet", "'10.0.0.0/8'::cidr", "'10.1.2.3/32'::cidr"}.each do |sql|
+      PG_DB.query_one("select #{sql}, format('%s', #{sql})") do |rs|
+        value = rs.read.or_panic
+        text = rs.read(String).or_panic
+        assert value.to_s == text, "#{sql}: #{value.to_s} != #{text}"
+      end.or_panic
+    end
+  end
+end
+
+describe "PG::Decoders arrays" do
+  it "reads array_agg of varchar as strings" do
+    value = PG_DB.query_one("select array_agg(x::varchar) from (values ('a'), ('b'), (null)) t(x)") { |rs| rs.read }.or_panic
+    assert same?(value, ["a", "b", nil] of DBValue), value.inspect
+  end
+
+  test_decode "varchar[]", "'{a,NULL,c}'::varchar[]", ["a", nil, "c"] of DBValue
+  test_decode "bpchar[]", "'{ab,c}'::char(2)[]", ["ab", "c "] of DBValue
+  test_decode "name[]", "'{a}'::name[]", ["a"] of DBValue
+  test_decode "xml[]", "ARRAY['<a/>'::xml]", ["<a/>"] of DBValue
+  test_decode "bytea[]", "ARRAY['\\x0102'::bytea, NULL]", [bytes([1_u8, 2_u8]), nil] of DBValue
+  test_decode "oid[]", "'{1,2}'::oid[]", [1_u32, 2_u32] of DBValue
+  test_decode "regtype[]", "ARRAY['int4'::regtype]", [23] of DBValue
+  test_decode "pg_lsn[]", "ARRAY['0/10'::pg_lsn]", [16_u64] of DBValue
+  test_decode "json[]", %(ARRAY['{"a":1}'::json]), [JSONValue.new(%({"a":1}))] of DBValue
+  test_decode "jsonb[]", %(ARRAY['{"a":1}'::jsonb, NULL]), [JSONValue.new(%({"a": 1})), nil] of DBValue
+  test_decode "timestamptz[]", "ARRAY['2020-01-02 03:04:05+00'::timestamptz]", [Time.utc(2020, 1, 2, 3, 4, 5)] of DBValue
+  test_decode "interval[]", "ARRAY['1 day'::interval]", [Interval.new(0_i64, 1, 0)] of DBValue
+  test_decode "point[]", "ARRAY['(1,2)'::point]", [Point.new(1.0, 2.0)] of DBValue
+  test_decode "lseg[]", "ARRAY['[(1,2),(3,4)]'::lseg]", [LineSegment.new(1.0, 2.0, 3.0, 4.0)] of DBValue
+  test_decode "path[]", "ARRAY['[(1,2),(3,4)]'::path]", [Path.new([Point.new(1.0, 2.0), Point.new(3.0, 4.0)], false)] of DBValue
+  test_decode "box[]", "ARRAY['(3,4),(1,2)'::box]", [Box.new(1.0, 2.0, 3.0, 4.0)] of DBValue
+  test_decode "polygon[]", "ARRAY['((1,2),(3,4))'::polygon]", [Polygon.new([Point.new(1.0, 2.0), Point.new(3.0, 4.0)])] of DBValue
+  test_decode "line[]", "ARRAY['{1,2,3}'::line]", [Line.new(1.0, 2.0, 3.0)] of DBValue
+  test_decode "circle[]", "ARRAY['<(1,2),3>'::circle]", [Circle.new(1.0, 2.0, 3.0)] of DBValue
+  test_decode "record[]", "ARRAY[ROW(1, 'a'), NULL]", [Record.new([1, "a"] of DBValue), nil] of DBValue
+  test_decode "time[]", "ARRAY['01:02:03'::time, NULL]", [span(1, 2, 3), nil] of DBValue
+  test_decode "timetz[]", "ARRAY['01:02:03+02'::timetz]", [TimeTz.new(span(1, 2, 3), 7200)] of DBValue
+  test_decode "inet[]", "ARRAY['1.2.3.4'::inet, NULL, '::1/64']", [inet("1.2.3.4", 32), nil, inet("::1", 64)] of DBValue
+  test_decode "cidr[]", "ARRAY['10.0.0.0/8'::cidr]", [inet("10.0.0.0", 8, true)] of DBValue
+  test_decode "macaddr[]", "ARRAY['08:00:2b:01:02:03'::macaddr]", ["08:00:2b:01:02:03"] of DBValue
+  test_decode "macaddr8[]", "ARRAY['08:00:2b:01:02:03:04:05'::macaddr8]", ["08:00:2b:01:02:03:04:05"] of DBValue
+  test_decode "money[]", "ARRAY['1.50'::money, NULL]", [150_i64, nil] of DBValue
+  test_decode "bit[]", "ARRAY[B'10'::bit(2)]", ["10"] of DBValue
+  test_decode "varbit[]", "ARRAY[B'1'::varbit, B'0101']", ["1", "0101"] of DBValue
+
+  it "reads typed arrays" do
+    assert PG_DB.query_one("select '{a,b}'::varchar[]", as: Array(String)).or_panic == ["a", "b"]
+    assert PG_DB.query_one("select '{a,NULL}'::varchar[]", as: Array(String?)).or_panic == ["a", nil]
+    assert PG_DB.query_one("select '{ab}'::char(2)[]", as: Array(String)).or_panic == ["ab"]
+    assert PG_DB.query_one("select ARRAY['08:00:2b:01:02:03'::macaddr]", as: Array(String)).or_panic == ["08:00:2b:01:02:03"]
+    assert PG_DB.query_one("select ARRAY[B'101']", as: Array(String)).or_panic == ["101"]
+    assert PG_DB.query_one("select ARRAY['1.50'::money]", as: Array(Int64)).or_panic == [150_i64]
+    assert PG_DB.query_one("select ARRAY['\\x01'::bytea]", as: Array(Bytes)).or_panic == [bytes([1_u8])]
+    assert PG_DB.query_one("select ARRAY['1 day'::interval]", as: Array(Interval)).or_panic == [Interval.new(0_i64, 1, 0)]
+    assert PG_DB.query_one("select ARRAY['01:02:03'::time]", as: Array(Span)).or_panic == [span(1, 2, 3)]
+    assert PG_DB.query_one("select ARRAY['01:02:03+02'::timetz]", as: Array(TimeTz)).or_panic == [TimeTz.new(span(1, 2, 3), 7200)]
+    assert PG_DB.query_one("select ARRAY['1.2.3.4'::inet, NULL]", as: Array(Inet?)).or_panic == [inet("1.2.3.4", 32), nil]
+    assert PG_DB.query_one("select ARRAY['2020-01-02 00:00+00'::timestamptz]", as: Array(Time)).or_panic == [Time.utc(2020, 1, 2)]
+  end
+end
+
+describe "PG binding new types" do
+  test_insert_and_read "timetz", TimeTz.new(span(12, 34, 56, 789_000), 3 * 3600)
+  test_insert_and_read "timetz", TimeTz.new(span(23, 59, 59, 999_999), -(9 * 3600 + 30 * 60))
+  test_insert_and_read "inet", inet("192.168.1.5", 32)
+  test_insert_and_read "inet", inet("192.168.1.5", 24)
+  test_insert_and_read "inet", inet("2001:db8::1", 128)
+  test_insert_and_read "inet", inet("2001:db8::1", 64)
+  test_insert_and_read "cidr", inet("10.0.0.0", 8, true)
+  test_insert_and_read "cidr", inet("2001:db8::", 32, true)
+
+  it "binds arrays of timetz and inet" do
+    PG_DB.exec("drop table if exists test_arrays").or_panic
+    PG_DB.exec("create table test_arrays (t timetz[], i inet[])").or_panic
+    times = [TimeTz.new(span(1, 2, 3), 7200), nil] of DBValue
+    addrs = [inet("1.2.3.4", 32), inet("::1", 64), nil] of DBValue
+    PG_DB.exec("insert into test_arrays values ($1, $2)", args: [times, addrs] of DBValue).or_panic
+    PG_DB.query_one("select t, i from test_arrays") do |rs|
+      t = rs.read.or_panic
+      i = rs.read.or_panic
+      assert same?(t, times), t.inspect
+      assert same?(i, addrs), i.inspect
+    end.or_panic
+  end
+end

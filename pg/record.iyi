@@ -12,7 +12,7 @@ import std/int
 import db/db/errors::{DBError}
 import db/db/value::{DBValue, CustomValue}
 import pg/pq/stream::{ByteSource}
-import pg/decoder::{Decoder, Decoders}
+import pg/decoder::{Decoder, Decoders, ArrayDecoder}
 
 # The fields of one composite value, in order; `nil` for a NULL field.
 pub class Record < CustomValue
@@ -77,3 +77,4 @@ pub class RecordDecoder < Decoder
 end
 
 Decoders.register_decoder RecordDecoder.new
+Decoders.register_decoder ArrayDecoder.new([2287], RecordDecoder.new)

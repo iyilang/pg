@@ -1,0 +1,58 @@
+# PostgreSQL's `timetz`: a time of day with its UTC offset.
+module pg/time_tz
+
+import std/int
+import std/time::{Span}
+import db/db/value::{CustomValue}
+
+# A `time with time zone`: the time since midnight and the offset from UTC
+# in seconds, positive EAST of Greenwich as ISO 8601 writes it (the wire
+# carries the opposite sign).
+pub class TimeTz < CustomValue
+  getter time : Span
+  getter offset : Int32
+
+  def initialize(@time : Span, @offset : Int32)
+  end
+
+  def ==(other : TimeTz) : Bool
+    time == other.time && offset == other.offset
+  end
+
+  # As PostgreSQL prints it, which it also reads: `12:34:56.789+03`,
+  # `01:02:03-05:30`.
+  def to_s : String
+    String.build do |io|
+      total = time.total_seconds_i64
+      two(io, total // 3600)
+      io << ':'
+      two(io, total // 60 % 60)
+      io << ':'
+      two(io, total % 60)
+      micros = time.nanoseconds // 1000
+      if micros > 0
+        fraction = micros.to_s.rjust(6, '0')
+        while fraction.ends_with?('0')
+          fraction = fraction[0, fraction.size - 1]
+        end
+        io << '.' << fraction
+      end
+      io << (offset < 0 ? '-' : '+')
+      abs = offset.abs.to_i64
+      two(io, abs // 3600)
+      if abs % 3600 != 0
+        io << ':'
+        two(io, abs // 60 % 60)
+        if abs % 60 != 0
+          io << ':'
+          two(io, abs % 60)
+        end
+      end
+    end
+  end
+
+  private def two(io : String::Builder, n : Int64) : Nil
+    io << '0' if n < 10
+    io << n
+  end
+end

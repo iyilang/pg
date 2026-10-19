@@ -19,6 +19,9 @@ import pg/errors::{RuntimeError}
 import pg/numeric::{Numeric}
 import pg/interval::{Interval}
 import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
+import pg/time_tz::{TimeTz}
+import pg/inet::{Inet}
+import std/netip::{IP, Prefix}
 
 # A `uuid` column. `DBValue` is a closed set and `std/uuid`'s `UUID` is not
 # in it, so the value a plain `read` answers wraps one; `read(UUID)` answers
@@ -71,22 +74,54 @@ pub abstract class Decoder
   abstract def type_name : String
 end
 
+# Text types, and the types read as their text: `macaddr`/`macaddr8` as
+# `08:00:2b:01:02:03` and `bit`/`varbit` as a string of `0`s and `1`s.
 pub class StringDecoder < Decoder
+  MACADDR  =  829
+  MACADDR8 =  774
+  BIT      = 1560
+  VARBIT   = 1562
+
   OIDS = [
-    19,   # name (internal type)
-    25,   # text
-    142,  # xml
-    705,  # unknown
-    1042, # blchar
-    1043, # varchar
+    19,       # name (internal type)
+    25,       # text
+    142,      # xml
+    705,      # unknown
+    1042,     # blchar
+    1043,     # varchar
+    MACADDR,  # macaddr
+    MACADDR8, # macaddr8
+    BIT,      # bit
+    VARBIT,   # varbit
   ]
+
+  HEX = "0123456789abcdef"
 
   def oids : Array(Int32)
     OIDS
   end
 
   def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
-    io.read_string(bytesize)
+    case oid
+    when MACADDR, MACADDR8
+      bytes = io.read_bytes(bytesize)!
+      String.build do |str|
+        bytes.each_with_index do |byte, i|
+          str << ':' if i > 0
+          str << HEX[(byte >> 4).to_i32] << HEX[(byte & 0x0F).to_i32]
+        end
+      end
+    when BIT, VARBIT
+      length = io.read_i32!
+      bytes = io.read_bytes(bytesize - 4)!
+      String.build(length) do |str|
+        length.times do |i|
+          str << ((bytes[i // 8] >> (7 - i % 8)) & 1_u8 == 1_u8 ? '1' : '0')
+        end
+      end
+    else
+      io.read_string(bytesize)
+    end
   end
 
   def type_name : String
@@ -194,7 +229,8 @@ end
 
 pub class Int64Decoder < Decoder
   OIDS = [
-    20, # int8 (bigint)
+    20,  # int8 (bigint)
+    790, # money, in the currency's minor unit (cents)
   ]
 
   def oids : Array(Int32)
@@ -573,6 +609,82 @@ pub class NumericDecoder < Decoder
   end
 end
 
+# A `time`: the time since midnight.
+pub class SpanDecoder < Decoder
+  OIDS = [
+    1083, # time
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    micros = io.read_i64!
+    Span.new(seconds: micros // 1_000_000, nanoseconds: (micros % 1_000_000) * 1_000)
+  end
+
+  def type_name : String
+    "Time::Span"
+  end
+end
+
+# A `timetz`: microseconds since midnight, then the zone in seconds west of
+# UTC.
+pub class TimeTzDecoder < Decoder
+  OIDS = [
+    1266, # timetz
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    micros = io.read_i64!
+    zone = io.read_i32!
+    TimeTz.new(Span.new(seconds: micros // 1_000_000, nanoseconds: (micros % 1_000_000) * 1_000), -zone)
+  end
+
+  def type_name : String
+    "PG::TimeTz"
+  end
+end
+
+# An `inet` or a `cidr`: the family (2 for IPv4, 3 for IPv6), the netmask
+# length, whether it is a cidr, the address size, and the address.
+pub class InetDecoder < Decoder
+  CIDR = 650
+
+  OIDS = [
+    869,  # inet
+    CIDR, # cidr
+  ]
+
+  def oids : Array(Int32)
+    OIDS
+  end
+
+  def decode(io : ByteSource, bytesize : Int32, oid : Int32) : DBValue | DBError
+    family = io.read_byte!
+    bits = io.read_byte!.to_i32
+    io.read_byte! # is_cidr, which the OID tells as well
+    size = io.read_byte!.to_i32
+    unless (family == 2_u8 && size == 4) || (family == 3_u8 && size == 16)
+      return RuntimeError.new("bad inet decode: family #{family}, #{size} address bytes")
+    end
+    if bits > size * 8
+      return RuntimeError.new("bad inet decode: netmask length #{bits}")
+    end
+    address = io.read_bytes(size)!.to_a
+    Inet.new(Prefix.new(IP.from_bytes(address), bits), oid == CIDR)
+  end
+
+  def type_name : String
+    "PG::Inet"
+  end
+end
+
 # The array header: its dimensions, its element OID, and each dimension's
 # size and lower bound.
 pub struct ArrayHeader
@@ -768,7 +880,7 @@ pub struct Decoders
     end
   end
 
-  {% for type in %w(Bool Char Int16 Int32 String Int64 Float32 Float64 Numeric Time UUID) %}
+  {% for type in %w(Bool Char Int16 Int32 String Int64 Float32 Float64 Numeric Time UUID Interval Span TimeTz Inet) %}
     def self.array_decoder(t : ({{ type.id }} | Nil).class) : Decoder
       {{ type.id }}Decoder.new
     end
@@ -777,6 +889,14 @@ pub struct Decoders
       {{ type.id }}Decoder.new
     end
   {% end %}
+
+  def self.array_decoder(t : (Bytes | Nil).class) : Decoder
+    ByteaDecoder.new
+  end
+
+  def self.array_decoder(t : Bytes.class) : Decoder
+    ByteaDecoder.new
+  end
 
   def self.array_decoder(t : Array(T).class) : Decoder forall T
     array_decoder(T)
@@ -807,16 +927,35 @@ Decoders.register_decoder BoxDecoder.new
 Decoders.register_decoder PolygonDecoder.new
 Decoders.register_decoder LineDecoder.new
 Decoders.register_decoder CircleDecoder.new
+Decoders.register_decoder SpanDecoder.new
+Decoders.register_decoder TimeTzDecoder.new
+Decoders.register_decoder InetDecoder.new
 
 # Arrays of the element types above. crystal-pg's `array_type` macro.
 Decoders.register_decoder ArrayDecoder.new([1000], BoolDecoder.new)
 Decoders.register_decoder ArrayDecoder.new([1002], CharDecoder.new)
 Decoders.register_decoder ArrayDecoder.new([1005], Int16Decoder.new)
 Decoders.register_decoder ArrayDecoder.new([1007], Int32Decoder.new)
-Decoders.register_decoder ArrayDecoder.new([1016], Int64Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([1016, 791], Int64Decoder.new)
 Decoders.register_decoder ArrayDecoder.new([1021], Float32Decoder.new)
 Decoders.register_decoder ArrayDecoder.new([1022], Float64Decoder.new)
-Decoders.register_decoder ArrayDecoder.new([1009], StringDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1009, 1003, 143, 1014, 1015, 1040, 775, 1561, 1563], StringDecoder.new)
 Decoders.register_decoder ArrayDecoder.new([1231], NumericDecoder.new)
-Decoders.register_decoder ArrayDecoder.new([1115, 1182], TimeDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1115, 1182, 1185], TimeDecoder.new)
 Decoders.register_decoder ArrayDecoder.new([2951], UUIDDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1001], ByteaDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1028], UIntDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([2211], Int32Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([3221], UInt64Decoder.new)
+Decoders.register_decoder ArrayDecoder.new([199, 3807], JsonDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1187], IntervalDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1017], PointDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1018], LineSegmentDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1019], PathDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1020], BoxDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1027], PolygonDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([629], LineDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([719], CircleDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1183], SpanDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1270], TimeTzDecoder.new)
+Decoders.register_decoder ArrayDecoder.new([1041, 651], InetDecoder.new)

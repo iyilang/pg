@@ -1,0 +1,45 @@
+# PostgreSQL's `inet` and `cidr`.
+module pg/inet
+
+import std/int
+import std/netip::{IP, Prefix}
+import db/db/value::{CustomValue}
+
+# An `inet` (a host address with an optional netmask length) or a `cidr` (a
+# network, its host bits zero): the address and length as a `Prefix`, host
+# bits as stored.
+pub class Inet < CustomValue
+  getter prefix : Prefix
+  @cidr : Bool
+
+  def initialize(@prefix : Prefix, @cidr : Bool = false)
+  end
+
+  # Whether the value is a `cidr` rather than an `inet`.
+  def cidr? : Bool
+    @cidr
+  end
+
+  def ip : IP
+    @prefix.ip
+  end
+
+  def length : Int32
+    @prefix.length
+  end
+
+  def ==(other : Inet) : Bool
+    prefix == other.prefix && cidr? == other.cidr?
+  end
+
+  # As PostgreSQL prints it, which it also reads: an `inet` of a whole
+  # address without its length (`10.1.2.3`, `::1`), anything else with it
+  # (`10.1.2.3/8`, `10.0.0.0/8` for a `cidr`).
+  def to_s : String
+    if !cidr? && length == prefix.bit_length
+      ip.to_s
+    else
+      "#{ip}/#{length}"
+    end
+  end
+end
