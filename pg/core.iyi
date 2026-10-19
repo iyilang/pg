@@ -449,6 +449,23 @@ pub class PGConnection < Connection
     @connection.server_parameters["server_version"]?
   end
 
+  # The process id of the server process this connection talks to, as
+  # `select pg_backend_pid()` answers it: 0 when the server named none.
+  def backend_pid : Int32
+    @connection.backend_pid
+  end
+
+  # Asks the server to cancel the statement this connection is running,
+  # which then fails with SQLSTATE 57014 (query_canceled) and leaves the
+  # connection usable; when none is running, nothing happens. Meant to be
+  # called from another task while this one waits on the statement. The
+  # request goes on a new connection to the same server, unencrypted
+  # whatever the `sslmode`, as libpq before 17 sends it; it carries only
+  # the backend's pid and a secret key, no credentials.
+  def cancel : Nil | DBError
+    @connection.cancel
+  end
+
   # Execute several statements. No results are returned.
   def exec_all(query : String) : Nil | DBError
     @connection.simple_query(query)

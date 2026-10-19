@@ -8,6 +8,7 @@
 module pg/pq/connection
 
 import std/int
+import std/time::{Time}
 import std/text
 import std/file
 import std/socket::{IyiSocket, SocketError}
@@ -33,6 +34,13 @@ pub class PQConnection
   property notice_handler : Proc(Notice, Nil)
   property notification_handler : Proc(Notification, Nil)
   @established = false
+  # The session's backend process and the key a CancelRequest for it
+  # carries, from the server's BackendKeyData; 0 until it sends one.
+  @backend_pid = 0
+  @secret_key = 0
+  # When the attempt that opened this session runs out of `connect_timeout`,
+  # on the monotonic clock in milliseconds; nil for no bound.
+  @deadline_ms : Int64? = nil
 
   def initialize(@stream : Stream, @conninfo : ConnInfo)
     @server_parameters = {} of String => String
@@ -43,6 +51,20 @@ pub class PQConnection
   # The code an SSLRequest sends where a startup message sends its
   # protocol version.
   SSL_REQUEST_CODE = 80877103
+
+  # The code a CancelRequest sends where a startup message sends its
+  # protocol version.
+  CANCEL_REQUEST_CODE = 80877102
+
+  # How much sooner than its deadline a wait may end and still be taken
+  # for the timeout's: a socket's timer fires on the platform's tick.
+  TIMEOUT_SLACK_MS = 50
+
+  # The process id of the session's backend on the server, 0 when the
+  # server named none.
+  def backend_pid : Int32
+    @backend_pid
+  end
 
   # The session *conninfo* describes, started and authenticated, encrypted
   # as its `sslmode` asks: `disable` never; `prefer` when the server takes
@@ -71,8 +93,9 @@ pub class PQConnection
     pq = open(conninfo, ssl)!
     connected = pq.connect(conninfo.replication)
     if connected.is_a?(DBError)
+      timed_out = pq.timed_out?
       pq.close
-      return connected
+      return timed_out ? timeout_error(conninfo) : connected
     end
     pq
   end
@@ -81,40 +104,122 @@ pub class PQConnection
   # host names when that is a path, TCP otherwise - and over TCP asks for
   # TLS as *ssl* says: `:off` not at all, `:must` with no session without
   # it, `:try` going on unencrypted when the server declines or the
-  # handshake fails.
+  # handshake fails. The connect, the TLS handshake, and the startup
+  # `connect` makes after, take no longer than `connect_timeout` together.
   def self.open(conninfo : ConnInfo, ssl : Symbol = :off) : PQConnection | DBError
     unix = conninfo.unix_socket?
     # The configuration first: a root or client certificate that cannot be
     # read is the caller's to fix before any server is asked anything.
     config = unix || ssl == :off ? nil : tls_config(conninfo)!
 
-    socket = if unix
+    timeout_ms = conninfo.connect_timeout_ms
+    deadline = timeout_ms ? now_ms + timeout_ms : nil
+    socket = connect_socket(conninfo, timeout_ms)!
+    pq = PQConnection.new(Stream.new(socket), conninfo)
+    pq.bound_by(deadline)
+    unless pq.arm_timeouts
+      socket.close
+      return timeout_error(conninfo)
+    end
+    return pq unless config
+    encrypted = pq.request_tls(config)
+    return pq if encrypted == true || (encrypted == false && ssl == :try)
+    timed_out = pq.timed_out?
+    socket.close unless socket.closed?
+    return timeout_error(conninfo) if timed_out && encrypted != false
+    case encrypted
+    when TlsError
+      return ConnectionError.new("TLS handshake failed: #{encrypted.message}") if ssl == :must
+      LOG.debug { "TLS handshake failed (#{encrypted.message}): connecting unencrypted" }
+      open(conninfo, :off)
+    when DBError
+      encrypted
+    else
+      ConnectionError.new("the server does not support TLS, but sslmode=#{conninfo.sslmode} requires it")
+    end
+  end
+
+  # The socket *conninfo* names - a Unix socket in the directory its host
+  # names when that is a path, TCP otherwise - connected within
+  # *timeout_ms* when it is given. The bound is kept by cancelling the
+  # connect as well as by handing it to std/socket, which on Windows
+  # waits as long as the kernel does (`ConnectEx`: 21 s measured to an
+  # address that drops the handshake).
+  protected def self.connect_socket(conninfo : ConnInfo, timeout_ms : Int32?) : IyiSocket | DBError
+    fired = false
+    socket = if conninfo.unix_socket?
                IyiSocket.connect_unix(File.join(conninfo.host, ".s.PGSQL.#{conninfo.port}"))
+             elsif ms = timeout_ms
+               host = conninfo.host
+               port = conninfo.port
+               got = nil.as(IyiSocket | Cancelled | SocketError | Nil)
+               group do |g|
+                 connecting = g.spawn { IyiSocket.connect(host, port, ms) }
+                 g.spawn do
+                   unless sleep(ms).is_a?(Cancelled)
+                     fired = true
+                     g.cancel_children
+                   end
+                   0
+                 end
+                 got = connecting.value
+                 g.cancel_children
+               end
+               got
              else
                IyiSocket.connect(conninfo.host, conninfo.port)
              end
     case socket
     when IyiSocket
-      pq = PQConnection.new(Stream.new(socket), conninfo)
-      return pq unless config
-      encrypted = pq.request_tls(config)
-      return pq if encrypted == true || (encrypted == false && ssl == :try)
-      pq.stream.socket.close unless pq.stream.socket.closed?
-      case encrypted
-      when TlsError
-        return ConnectionError.new("TLS handshake failed: #{encrypted.message}") if ssl == :must
-        LOG.debug { "TLS handshake failed (#{encrypted.message}): connecting unencrypted" }
-        open(conninfo, :off)
-      when DBError
-        encrypted
-      else
-        ConnectionError.new("the server does not support TLS, but sslmode=#{conninfo.sslmode} requires it")
-      end
+      socket
     when SocketError
+      return timeout_error(conninfo) if timeout_ms && socket.timed_out?
       ConnectionError.new("Cannot establish connection: #{socket.reason}")
     else
-      ConnectionError.new("Cannot establish connection: cancelled")
+      fired ? timeout_error(conninfo) : ConnectionError.new("Cannot establish connection: cancelled")
     end
+  end
+
+  # The monotonic clock in milliseconds.
+  protected def self.now_ms : Int64
+    (Time.monotonic_nanoseconds // 1000000_u64).to_i64
+  end
+
+  # What an attempt that ran out of `connect_timeout` answers.
+  protected def self.timeout_error(conninfo : ConnInfo) : ConnectionError
+    where = conninfo.unix_socket? ? File.join(conninfo.host, ".s.PGSQL.#{conninfo.port}") : IyiSocket.endpoint(conninfo.host, conninfo.port)
+    ConnectionError.new("Cannot establish connection: timeout expired after #{conninfo.connect_timeout} s (connect_timeout) connecting to #{where}")
+  end
+
+  # The attempt opening this session ends at *deadline_ms*, nil for never.
+  protected def bound_by(deadline_ms : Int64?) : Nil
+    @deadline_ms = deadline_ms
+  end
+
+  # The milliseconds left of the attempt's `connect_timeout`, nil when it
+  # has none.
+  protected def remaining_ms : Int64?
+    if deadline = @deadline_ms
+      deadline - PQConnection.now_ms
+    end
+  end
+
+  # Bounds the socket's reads and writes by what is left of the attempt:
+  # false when nothing is. What is left is never more than
+  # `connect_timeout_ms`, an `Int32`.
+  protected def arm_timeouts : Bool
+    left = remaining_ms
+    return true if left.nil?
+    return false if left <= 0
+    @stream.socket.read_timeout_ms = left.to_i32
+    @stream.socket.write_timeout_ms = left.to_i32
+    true
+  end
+
+  # Whether the attempt opening this session ran out of time.
+  protected def timed_out? : Bool
+    left = remaining_ms
+    !left.nil? && left <= TIMEOUT_SLACK_MS
   end
 
   # Asks the server for TLS (an SSLRequest) and, when it agrees, makes the
@@ -131,7 +236,11 @@ pub class PQConnection
       if @stream.buffered?
         return ConnectionError.new("the server sent unencrypted data after agreeing to TLS")
       end
-      tls = TlsClient.over(@stream.socket, @conninfo.host, config)
+      tls = if left = remaining_ms
+              TlsClient.over(@stream.socket, @conninfo.host, config, left < 1 ? 1 : left.to_i32)
+            else
+              TlsClient.over(@stream.socket, @conninfo.host, config)
+            end
       return tls if tls.is_a?(TlsError)
       @stream.start_tls(tls)
       true
@@ -362,14 +471,20 @@ pub class PQConnection
   end
 
   # Starts the session: startup, authentication, and the parameters the
-  # server reports until it is ready for a query.
+  # server reports until it is ready for a query, within what is left of
+  # `connect_timeout`.
   def connect(replication : String? = nil) : Nil | DBError
+    return PQConnection.timeout_error(@conninfo) unless arm_timeouts
     startup_args = [
       "user", @conninfo.user,
       "database", @conninfo.database,
       "application_name", @conninfo.application_name,
       "client_encoding", "utf8",
     ]
+    if options = @conninfo.options
+      startup_args << "options"
+      startup_args << options
+    end
     if replication
       startup_args << "replication"
       startup_args << replication
@@ -384,7 +499,8 @@ pub class PQConnection
       frame = read!
       case frame
       when Frame::BackendKeyData
-        # do nothing
+        @backend_pid = frame.pid
+        @secret_key = frame.secret
       when Frame::ReadyForQuery
         break
       else
@@ -392,8 +508,40 @@ pub class PQConnection
       end
     end
 
+    unless @deadline_ms.nil?
+      @stream.socket.read_timeout_ms = nil
+      @stream.socket.write_timeout_ms = nil
+    end
     @established = true
     nil
+  end
+
+  # Asks the server to cancel what this session is running, from any task,
+  # the session busy or not: a CancelRequest naming its backend, sent on a
+  # new connection to the same host and port (or Unix socket), which the
+  # server closes once it has the request. The request is sent unencrypted
+  # whatever the `sslmode`, as libpq before 17 sends it. What was running
+  # then fails with SQLSTATE 57014 (query_canceled); if nothing was, the
+  # request does nothing. `connect_timeout` bounds the exchange.
+  def cancel : Nil | DBError
+    if @backend_pid == 0
+      return ConnectionError.new("Cannot cancel: the server sent no BackendKeyData for this session")
+    end
+    timeout_ms = @conninfo.connect_timeout_ms
+    socket = PQConnection.connect_socket(@conninfo, timeout_ms)!
+    socket.read_timeout_ms = timeout_ms
+    socket.write_timeout_ms = timeout_ms
+    stream = Stream.new(socket)
+    stream.write_i32(16)
+    stream.write_i32(CANCEL_REQUEST_CODE)
+    stream.write_i32(@backend_pid)
+    stream.write_i32(@secret_key)
+    sent = stream.flush
+    # The server answers nothing and closes the connection when it has the
+    # request: the end of the stream is that.
+    stream.read_byte unless sent.is_a?(DBError)
+    stream.close
+    sent.is_a?(DBError) ? ConnectionError.new("Cannot send the cancel request: #{sent.message}") : nil
   end
 
   private def handle_auth(auth_frame : Frame::Authentication) : Nil | DBError

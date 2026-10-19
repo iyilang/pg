@@ -19,13 +19,26 @@ pub struct ConnInfo
 
   SSL_MODES = [:disable, :allow, :prefer, :require, :"verify-ca", :"verify-full"]
 
-  # The keys a URI's query or a `key=value` string may hold besides the TLS
-  # and authentication ones `handle_sslparam` reads: the connection's own,
-  # and iyi-db's pool options. Any other is reported, not silently dropped.
+  # The keys a URI's query or a `key=value` string may hold besides the ones
+  # `handle_param` reads: the connection's own, and iyi-db's pool options.
+  # Any other is reported, not silently dropped.
   KNOWN_KEYS = [
     "host", "port", "dbname", "user", "password", "application_name", "replication",
     "initial_pool_size", "max_pool_size", "max_idle_pool_size", "checkout_timeout",
     "retry_attempts", "retry_delay", "prepared_statements", "prepared_statements_cache",
+  ]
+
+  # The parameters a `PG*` variable gives when the URL or string does not,
+  # each with its variable, as libpq has them.
+  ENV_DEFAULTS = [
+    {"sslmode", "PGSSLMODE"},
+    {"sslrootcert", "PGSSLROOTCERT"},
+    {"sslcert", "PGSSLCERT"},
+    {"sslkey", "PGSSLKEY"},
+    {"channel_binding", "PGCHANNELBINDING"},
+    {"ssl_min_protocol_version", "PGSSLMINPROTOCOLVERSION"},
+    {"connect_timeout", "PGCONNECT_TIMEOUT"},
+    {"options", "PGOPTIONS"},
   ]
 
   # The `ssl_min_protocol_version`s std/tls speaks.
@@ -77,12 +90,25 @@ pub struct ConnInfo
   # The authentication methods the server may ask for.
   getter auth_methods : Array(String)
 
+  # The seconds one connection attempt may take - the TCP connect, the TLS
+  # handshake, and the startup and authentication until the server is
+  # ready for a query - or nil for no bound. As libpq has it, 0 or less is
+  # no bound and 1 is 2.
+  getter connect_timeout : Int32?
+
+  # The command-line options the server starts the session with, sent as
+  # the `options` startup parameter: `-c search_path=foo -c
+  # statement_timeout=5000`. Optional.
+  getter options : String?
+
   # A connection description from its parts; what is not given is taken from
   # the environment (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
   # `PGPASSWORD`, `PGAPPNAME`) or the password file. The database defaults
   # to the user's name, as libpq's does. An `sslmode` not in `SSL_MODES` is
-  # a mistake in the program, and panics.
-  def initialize(host : String? = nil, database : String? = nil, user : String? = nil, password : String? = nil, port : Int32? = nil, sslmode : Symbol = :prefer, application_name : String? = nil, @replication : String? = nil)
+  # a mistake in the program, and panics. The variables of `ENV_DEFAULTS`
+  # are read by `from_uri` and `from_hash`, which can refuse a value that
+  # is not one.
+  def initialize(host : String? = nil, database : String? = nil, user : String? = nil, password : String? = nil, port : Int32? = nil, sslmode : Symbol = :prefer, application_name : String? = nil, @replication : String? = nil, connect_timeout : Int32? = nil, options : String? = nil)
     raise "unknown sslmode #{sslmode}: #{SSL_MODES.join(", ")}" unless SSL_MODES.includes?(sslmode)
     @port = port || ((ENV["PGPORT"]? || "").to_i? || 5432)
     @host = ConnInfo.default_host(host, @port)
@@ -97,6 +123,22 @@ pub struct ConnInfo
     @sslrootcert = nil
     @channel_binding = :prefer
     @ssl_min_protocol_version = "TLSv1.2"
+    @connect_timeout = connect_timeout ? ConnInfo.effective_timeout(connect_timeout) : nil
+    @options = options.presence if options
+  end
+
+  # `connect_timeout` in milliseconds, nil for no bound.
+  def connect_timeout_ms : Int32?
+    if seconds = @connect_timeout
+      ms = seconds.to_i64 * 1000_i64
+      ms > 2147483647_i64 ? 2147483647 : ms.to_i32
+    end
+  end
+
+  # The bound *seconds* of `connect_timeout` mean, as libpq reads them.
+  protected def self.effective_timeout(seconds : Int32) : Int32?
+    return nil if seconds <= 0
+    seconds == 1 ? 2 : seconds
   end
 
   # Whether `host` names the directory of a Unix socket.
@@ -105,56 +147,103 @@ pub struct ConnInfo
   end
 
   # From either a `postgres://` (or `postgresql://`) URL or a libpq
-  # `key=value` string.
+  # `key=value` string, whose values may be single-quoted to hold spaces
+  # (`options='-c search_path=foo'`), with `\'` and `\\` inside, as
+  # libpq reads them.
   def self.from_conninfo_string(conninfo : String) : ConnInfo | DBError
     if conninfo.starts_with?("postgres://") || conninfo.starts_with?("postgresql://")
       uri = URI.parse?(conninfo)
       return ArgumentError.new("invalid connection URI: #{conninfo}") if uri.nil?
       from_uri(uri)
     else
-      return from_hash({} of String => String) if conninfo == ""
-
-      args = {} of String => String
-      conninfo.split(' ').each do |pair|
-        next if pair.empty?
-        k, eq, v = pair.partition('=')
-        return ArgumentError.new("invalid paramater: #{pair}") if eq.empty?
-        args[k] = v
-      end
-      from_hash(args)
+      from_hash(parse_key_values(conninfo)!)
     end
+  end
+
+  # The pairs of a libpq `key=value` string.
+  protected def self.parse_key_values(conninfo : String) : Hash(String, String) | DBError
+    args = {} of String => String
+    chars = conninfo.chars
+    i = skip_spaces(chars, 0)
+    while i < chars.size
+      start = i
+      while i < chars.size && !chars[i].whitespace? && chars[i] != '='
+        i += 1
+      end
+      key = chars[start...i].join
+      i = skip_spaces(chars, i)
+      return ArgumentError.new("invalid paramater: #{key}: missing \"=\" after it") unless i < chars.size && chars[i] == '='
+      i = skip_spaces(chars, i + 1)
+      quoted = i < chars.size && chars[i] == '\''
+      i += 1 if quoted
+      closed = !quoted
+      value = [] of Char
+      while i < chars.size
+        char = chars[i]
+        if quoted && char == '\''
+          closed = true
+          i += 1
+          break
+        end
+        break if !quoted && char.whitespace?
+        if char == '\\' && i + 1 < chars.size
+          i += 1
+          char = chars[i]
+        end
+        value << char
+        i += 1
+      end
+      return ArgumentError.new("invalid paramater: #{key}: unterminated quoted string") unless closed
+      args[key] = value.join
+      i = skip_spaces(chars, i)
+    end
+    args
+  end
+
+  # The index of the first of *chars* from *i* that is not a space.
+  private def self.skip_spaces(chars : Array(Char), i : Int32) : Int32
+    while i < chars.size && chars[i].whitespace?
+      i += 1
+    end
+    i
   end
 
   # From a `URI`: its host (or the `host` parameter), port, path as the
   # database, user and password, and `application_name`, `replication`,
   # `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, `channel_binding`,
-  # `ssl_min_protocol_version` and `auth_methods` from its query.
+  # `ssl_min_protocol_version`, `connect_timeout`, `options` and
+  # `auth_methods` from its query; the `ENV_DEFAULTS` for those it does not
+  # give.
   def self.from_uri(uri : URI) : ConnInfo | DBError
     params = Params.parse(uri.query || "")
     hostname = (uri.hostname || "").presence || params["host"]? || ""
     port = uri.port || parse_port(params["port"]?)! || env_port!
     info = ConnInfo.new(hostname.presence, uri.path, uri.user, uri.password, port, :prefer, params["application_name"]?, params["replication"]?)
+    given = [] of String
     params.each do |key, value|
-      handled = info.handle_sslparam(key, value)
+      handled = info.handle_param(key, value)
       return handled if handled.is_a?(DBError)
+      given << key
     end
-    info.default_sslmode(params["sslmode"]?)
+    info.apply_defaults(given)!
     info
   end
 
   # From libpq "conninfo" keys: `"host"`, `"dbname"`, `"user"`,
   # `"password"`, `"port"`, `"sslmode"`, `"sslcert"`, `"sslkey"`,
   # `"sslrootcert"`, `"channel_binding"`, `"ssl_min_protocol_version"`,
-  # `"application_name"`, `"replication"` and `"auth_methods"`.
+  # `"connect_timeout"`, `"options"`, `"application_name"`,
+  # `"replication"` and `"auth_methods"`; the `ENV_DEFAULTS` for those it
+  # does not give.
   def self.from_hash(params : Hash(String, String)) : ConnInfo | DBError
     port = parse_port(params["port"]?)! || env_port!
     info = ConnInfo.new(params["host"]?, params["dbname"]?, params["user"]?,
       params["password"]?, port, :prefer, params["application_name"]?, params["replication"]?)
     params.each do |key, value|
-      handled = info.handle_sslparam(key, value)
+      handled = info.handle_param(key, value)
       return handled if handled.is_a?(DBError)
     end
-    info.default_sslmode(params["sslmode"]?)
+    info.apply_defaults(params.keys)!
     info
   end
 
@@ -183,10 +272,23 @@ pub struct ConnInfo
     end
   end
 
-  # `sslrootcert=system` without an `sslmode` means `verify-full`, as libpq
-  # has it: the system's roots are trusted for the host's name alone.
-  protected def default_sslmode(given : String?) : Nil
-    @sslmode = :"verify-full" if given.nil? && @sslrootcert == "system"
+  # Each `ENV_DEFAULTS` parameter not *given*, from its variable when that
+  # is set; a value the parameter cannot take is an `ArgumentError` naming
+  # the variable. Then `sslrootcert=system` without an `sslmode`, given or
+  # from `PGSSLMODE`, means `verify-full`, as libpq has it: the system's
+  # roots are trusted for the host's name alone.
+  protected def apply_defaults(given : Array(String)) : Nil | DBError
+    ENV_DEFAULTS.each do |default|
+      key, var = default
+      next if given.includes?(key)
+      value = ENV[var]?
+      next if value.nil? || value.empty?
+      handled = handle_param(key, value)
+      return ArgumentError.new("invalid #{var}: #{handled.message}") if handled.is_a?(DBError)
+    end
+    mode_given = given.includes?("sslmode") || !(ENV["PGSSLMODE"]? || "").empty?
+    @sslmode = :"verify-full" if !mode_given && @sslrootcert == "system"
+    nil
   end
 
   protected def self.parse_port(port : String?) : Int32? | DBError
@@ -202,7 +304,7 @@ pub struct ConnInfo
     value.to_i? || ArgumentError.new("invalid PGPORT: #{value}")
   end
 
-  protected def handle_sslparam(key : String, value : String) : Nil | DBError
+  protected def handle_param(key : String, value : String) : Nil | DBError
     case key
     when "sslmode"
       @sslmode = ConnInfo.parse_sslmode(value)!
@@ -219,6 +321,12 @@ pub struct ConnInfo
         return ArgumentError.new("ssl_min_protocol_version #{value} not supported: TLSv1.2 and TLSv1.3 are")
       end
       @ssl_min_protocol_version = value
+    when "connect_timeout"
+      seconds = value.strip.to_i?
+      return ArgumentError.new("invalid integer value #{value.inspect} for connect_timeout") if seconds.nil?
+      @connect_timeout = ConnInfo.effective_timeout(seconds)
+    when "options"
+      @options = value.presence
     when "auth_methods"
       methods = [] of String
       value.split(',').each do |method|

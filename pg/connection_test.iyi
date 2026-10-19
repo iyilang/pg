@@ -1,12 +1,15 @@
 # crystal-pg's spec/pg/connection_spec.cr.
 module pg/connection_test
 
+import std/env
 import std/time::{Time}
 import std/uri::{URI}
+import std/socket::{IyiSocket}
 import db
 import db/db/errors::*
 import db/db/spec::{describe, it, expect_error}
 import pg/pq/frame::{Notice, Notification}
+import pg/pq/errors::{PQError}
 import pg/core::{PGConnection}
 import pg/pq/stream::{Stream}
 import pg
@@ -23,6 +26,130 @@ describe "PG::Connection#initialize" do
     uri.query = "application_name=specs"
     with_db_at(uri.to_s) do |db|
       assert db.query_one("SHOW application_name", as: String).or_panic == "specs"
+    end
+  end
+end
+
+def elapsed_ms(since : UInt64) : Int64
+  ((Time.monotonic_nanoseconds - since) // 1000000_u64).to_i64
+end
+
+# Connects to *url*, which must fail with connect_timeout's error after
+# about *bound_ms*.
+def assert_times_out(url : String, bound_ms : Int64) : Nil
+  started = Time.monotonic_nanoseconds
+  result = ::Db.connect(url)
+  took = elapsed_ms(started)
+  if result.is_a?(ConnectionRefused)
+    assert result.message.includes?("timeout expired"), result.message
+  else
+    assert false, "#{url}: #{result.inspect}"
+  end
+  assert took >= bound_ms - 100 && took < bound_ms + 2000, "#{url}: #{took} ms"
+end
+
+describe "PG::Connection connect_timeout" do
+  it "gives up on a server that never answers, after the bound (1 meaning 2 s)" do
+    listener = IyiSocket.listen("127.0.0.1", 0)
+    defer listener.close
+    base = "postgres://postgres:postgres@127.0.0.1:#{listener.local_port}/db"
+    # unencrypted: the startup waits for an answer
+    env_var_bubble { assert_times_out("#{base}?sslmode=disable&connect_timeout=1", 2000) }
+    # prefer: the SSLRequest's answer does, and the bound is PGCONNECT_TIMEOUT's
+    env_var_bubble do
+      ENV["PGCONNECT_TIMEOUT"] = "1"
+      assert_times_out("#{base}?sslmode=prefer", 2000)
+    end
+  end
+
+  it "bounds a TLS handshake the server never answers" do
+    listener = IyiSocket.listen("127.0.0.1", 0)
+    defer listener.close
+    group do |g|
+      g.spawn do
+        peer = listener.accept
+        if peer.is_a?(IyiSocket)
+          peer.read(8) # the SSLRequest
+          peer.write("S")
+          # silent, whatever the client sends, until it gives up and closes
+          while (got = peer.read).is_a?(String) && !got.empty?
+          end
+          peer.close
+        end
+        0
+      end
+      env_var_bubble { assert_times_out("postgres://postgres:postgres@127.0.0.1:#{listener.local_port}/db?sslmode=require&connect_timeout=2", 2000) }
+    end
+  end
+
+  it "bounds the TCP connect to an address that drops it" do
+    started = Time.monotonic_nanoseconds
+    result = ::Db.connect("postgres://postgres:postgres@10.255.255.1:5432/db?sslmode=disable&connect_timeout=2")
+    took = elapsed_ms(started)
+    # a network that says the address is unreachable answers sooner
+    assert result.is_a?(ConnectionRefused), result.inspect
+    assert took < 4000, "#{took} ms"
+  end
+end
+
+describe "PG::Connection options" do
+  it "starts the session with the options given" do
+    uri = URI.parse(DB_URL)
+    uri.query = "options=-c%20search_path%3Dfoo%20-c%20statement_timeout%3D5000"
+    with_db_at(uri.to_s) do |db|
+      assert db.query_one("SHOW search_path", as: String).or_panic == "foo"
+      assert db.query_one("SHOW statement_timeout", as: String).or_panic == "5s"
+    end
+  end
+
+  it "takes them from PGOPTIONS" do
+    env_var_bubble do
+      ENV["PGOPTIONS"] = "-c search_path=bar"
+      with_db_at(DB_URL) do |db|
+        assert db.query_one("SHOW search_path", as: String).or_panic == "bar"
+      end
+    end
+  end
+end
+
+describe "PG::Connection#backend_pid" do
+  it "is the server process's id" do
+    with_connection do |conn|
+      assert conn.backend_pid != 0
+      assert conn.scalar("select pg_backend_pid()").or_panic == conn.backend_pid
+    end
+  end
+end
+
+describe "PG::Connection#cancel" do
+  it "cancels the running statement from another task, and the connection goes on" do
+    with_connection do |conn|
+      outcome = nil.as(DBError?)
+      sent = nil.as(DBError?)
+      took = 0_i64
+      group do |g|
+        g.spawn do
+          sleep(200)
+          sent = conn.cancel
+          0
+        end
+        started = Time.monotonic_nanoseconds
+        result = conn.exec("select pg_sleep(30)")
+        took = elapsed_ms(started)
+        outcome = result if result.is_a?(DBError)
+      end
+      assert sent.nil?, sent.inspect
+      error = outcome
+      assert error.is_a?(PQError) && error.field_message(:code) == "57014", error.inspect
+      assert took >= 150 && took < 5000, "#{took} ms"
+      assert conn.scalar("select 1").or_panic == 1
+    end
+  end
+
+  it "does nothing when no statement runs" do
+    with_connection do |conn|
+      conn.cancel.or_panic
+      assert conn.scalar("select 1").or_panic == 1
     end
   end
 end

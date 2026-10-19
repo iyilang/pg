@@ -42,7 +42,11 @@ pub def db_version_gte(major : Int32, minor : Int32 = 0, patch : Int32 = 0) : Bo
   ver[:major] >= major && ver[:minor] >= minor && ver[:patch] >= patch
 end
 
-ENV_VARS = ["PGDATABASE", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGPASSFILE", "PGAPPNAME"]
+ENV_VARS = [
+  "PGDATABASE", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGPASSFILE", "PGAPPNAME",
+  "PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGCHANNELBINDING",
+  "PGSSLMINPROTOCOLVERSION", "PGCONNECT_TIMEOUT", "PGOPTIONS",
+]
 
 # Runs the block without the `PG*` variables, and puts them back after.
 pub def env_var_bubble(& : -> Nil) : Nil

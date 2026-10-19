@@ -161,9 +161,140 @@ describe "PQ::ConnInfo.from_conninfo_string" do
     backend = MemoryBackend.new
     previous = LOG.own_backend
     LOG.backend = backend
-    parse("postgres://host/db?sslmdoe=verify-full&max_pool_size=2&application_name=x")
+    parse("postgres://host/db?sslmdoe=verify-full&max_pool_size=2&application_name=x&connect_timeout=5&options=-c%20a%3Db")
     LOG.backend = previous
     warnings = backend.entries.select { |e| e.severity >= Severity::Warn }.map(&.message)
     assert warnings == ["Ignoring the connection parameter sslmdoe, which this driver does not support"], warnings.inspect
+  end
+end
+
+describe "PQ::ConnInfo connect_timeout and options" do
+  it "reads connect_timeout as libpq does: 0 or less is none, 1 is 2" do
+    env_var_bubble do
+      assert parse("postgres://host/db").connect_timeout.nil?
+      assert parse("postgres://host/db").connect_timeout_ms.nil?
+      assert parse("postgres://host/db?connect_timeout=10").connect_timeout == 10
+      assert parse("host=host connect_timeout=10").connect_timeout_ms == 10000
+      assert parse("host=host connect_timeout=1").connect_timeout == 2
+      assert parse("host=host connect_timeout=0").connect_timeout.nil?
+      assert parse("postgres://host/db?connect_timeout=-5").connect_timeout.nil?
+      assert ConnInfo.new("host", connect_timeout: 1).connect_timeout == 2
+      expect_error(ConnInfo.from_conninfo_string("host=host connect_timeout=soon"), ArgumentError)
+      expect_error(ConnInfo.from_conninfo_string("postgres://host/db?connect_timeout=1.5"), ArgumentError)
+    end
+    nil
+  end
+
+  it "reads options, from a URL's query or a quoted value" do
+    env_var_bubble do
+      assert parse("postgres://host/db").options.nil?
+      got = parse("postgres://host/db?options=-c%20search_path%3Dfoo").options
+      assert got == "-c search_path=foo", got.inspect
+      got = parse("host=host options='-c search_path=foo -c statement_timeout=5000'").options
+      assert got == "-c search_path=foo -c statement_timeout=5000", got.inspect
+      assert ConnInfo.new("host", options: "-c a=b").options == "-c a=b"
+    end
+  end
+end
+
+describe "PQ::ConnInfo key=value strings" do
+  it "reads quoted values, escapes and spaces around = as libpq does" do
+    ci = parse("host = host  password='it\\'s a \\\\ secret' application_name='' user=a\\ b")
+    assert ci.host == "host", ci.host
+    assert ci.password == "it's a \\ secret", ci.password.inspect
+    assert ci.application_name == "", ci.application_name
+    assert ci.user == "a b", ci.user
+    expect_error(ConnInfo.from_conninfo_string("host='host"), ArgumentError)
+    expect_error(ConnInfo.from_conninfo_string("host"), ArgumentError)
+    expect_error(ConnInfo.from_conninfo_string("host=a port"), ArgumentError)
+    nil
+  end
+end
+
+describe "PQ::ConnInfo environment defaults" do
+  it "takes the TLS, connect_timeout and options parameters from PG* variables" do
+    env_var_bubble do
+      ENV["PGSSLMODE"] = "require"
+      ENV["PGSSLROOTCERT"] = "root.crt"
+      ENV["PGSSLCERT"] = "client.crt"
+      ENV["PGSSLKEY"] = "client.key"
+      ENV["PGCHANNELBINDING"] = "disable"
+      ENV["PGSSLMINPROTOCOLVERSION"] = "TLSv1.3"
+      ENV["PGCONNECT_TIMEOUT"] = "7"
+      ENV["PGOPTIONS"] = "-c search_path=foo"
+      [parse("postgres://host/db"), parse("host=host")].each do |ci|
+        assert ci.sslmode == :require
+        assert ci.sslrootcert == "root.crt"
+        assert ci.sslcert == "client.crt"
+        assert ci.sslkey == "client.key"
+        assert ci.channel_binding == :disable
+        assert ci.ssl_min_protocol_version == "TLSv1.3"
+        assert ci.connect_timeout == 7
+        assert ci.options == "-c search_path=foo"
+      end
+    end
+  end
+
+  it "lets the parameters given win over the variables" do
+    env_var_bubble do
+      ENV["PGSSLMODE"] = "require"
+      ENV["PGSSLROOTCERT"] = "root.crt"
+      ENV["PGSSLCERT"] = "client.crt"
+      ENV["PGSSLKEY"] = "client.key"
+      ENV["PGCHANNELBINDING"] = "disable"
+      ENV["PGSSLMINPROTOCOLVERSION"] = "TLSv1.3"
+      ENV["PGCONNECT_TIMEOUT"] = "7"
+      ENV["PGOPTIONS"] = "-c search_path=foo"
+      url = parse("postgres://host/db?sslmode=disable&sslrootcert=other.crt&sslcert=o.crt&sslkey=o.key&channel_binding=require&ssl_min_protocol_version=TLSv1.2&connect_timeout=3&options=-c%20x%3Dy")
+      pairs = parse("host=host sslmode=disable sslrootcert=other.crt sslcert=o.crt sslkey=o.key channel_binding=require ssl_min_protocol_version=TLSv1.2 connect_timeout=3 options='-c x=y'")
+      [url, pairs].each do |ci|
+        assert ci.sslmode == :disable
+        assert ci.sslrootcert == "other.crt"
+        assert ci.sslcert == "o.crt"
+        assert ci.sslkey == "o.key"
+        assert ci.channel_binding == :require
+        assert ci.ssl_min_protocol_version == "TLSv1.2"
+        assert ci.connect_timeout == 3
+        assert ci.options == "-c x=y"
+      end
+    end
+  end
+
+  it "refuses a variable's value its parameter cannot take, unless the parameter is given" do
+    bad = [
+      {"PGSSLMODE", "sometimes", "sslmode=require"},
+      {"PGCHANNELBINDING", "always", "channel_binding=prefer"},
+      {"PGSSLMINPROTOCOLVERSION", "TLSv1.1", "ssl_min_protocol_version=TLSv1.3"},
+      {"PGCONNECT_TIMEOUT", "soon", "connect_timeout=4"},
+    ]
+    bad.each do |entry|
+      var, value, param = entry
+      env_var_bubble do
+        ENV[var] = value
+        error = ConnInfo.from_conninfo_string("postgres://host/db")
+        assert error.is_a?(ArgumentError), "#{var}=#{value}: #{error.inspect}"
+        assert error.message.includes?(var), error.message if error.is_a?(ArgumentError)
+        expect_error(ConnInfo.from_conninfo_string("host=host"), ArgumentError)
+        parse("postgres://host/db?#{param}")
+        parse("host=host #{param}")
+      end
+    end
+    nil
+  end
+
+  it "takes PGSSLROOTCERT=system to mean verify-full unless an sslmode is given or PGSSLMODE set" do
+    env_var_bubble do
+      ENV["PGSSLROOTCERT"] = "system"
+      assert parse("postgres://host/db").sslmode == :"verify-full"
+      assert parse("host=host").sslmode == :"verify-full"
+      assert parse("postgres://host/db?sslmode=require").sslmode == :require
+      ENV["PGSSLMODE"] = "require"
+      assert parse("postgres://host/db").sslmode == :require
+      assert parse("host=host").sslmode == :require
+    end
+    env_var_bubble do
+      ENV["PGSSLMODE"] = "prefer"
+      assert parse("postgres://host/db?sslrootcert=system").sslmode == :prefer
+    end
   end
 end
