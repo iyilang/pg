@@ -19,17 +19,20 @@ Tested against PostgreSQL 16.
 
 ## Installation
 
-Add it to a project under the short name `pg`:
+Add it to a project under the short name `pg`, and iyi-db under `db`, whose
+`Db.open` a program calls:
 
 ```sh
 iyi get github.com/iyilang/pg --as pg
+iyi get github.com/iyilang/db --as db
 ```
 
 Files then `import pg` for the root module - `Pg.connect`,
 `Pg.connect_listen`, `Pg.connect_replication`, `Pg::VERSION` - and its other
 modules as `pg/pg/...`: the short name, then the module's path in the
 package. Importing `pg` (or `pg/pg/core`) registers the driver for
-`postgres://` and `postgresql://`.
+`postgres://` and `postgresql://`. A package required only by another is
+not named in a program's own imports, so `import db` needs the second line.
 
 ## Usage
 
