@@ -18,15 +18,13 @@ import pg/testing/spec_helper::*
 
 # Whether *a* and *b* are the same value of the same type: `1_i16` is not
 # `1`, as crystal's `eq` told an `Int16` from an `Int32` through the union.
-# The classes are compared by name: iyi's `Class` has no `==`
-# (`String == String` is false in iyi 0.17.0).
 def same?(a : DBValue, b : DBValue) : Bool
   if a.is_a?(Array(DBValue)) && b.is_a?(Array(DBValue))
     return false unless a.size == b.size
     a.each_with_index { |x, i| return false unless same?(x, b[i]) }
     return true
   end
-  a.class.to_s == b.class.to_s && a == b
+  a.class == b.class && a == b
 end
 
 # Selects *query* and checks that a plain `read` answers *expected*.

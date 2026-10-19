@@ -15,15 +15,13 @@ import pg/testing/spec_helper::*
 
 # Whether *a* and *b* are the same value of the same type, element by
 # element: a plain `read` of an array answers nested `Array(DBValue)`s.
-# Types are compared by name, here and in the `typeof` checks below: iyi's
-# `Class` has no `==` (`String == String` is false in iyi 0.17.0).
 def same?(a : DBValue, b : DBValue) : Bool
   if a.is_a?(Array(DBValue)) && b.is_a?(Array(DBValue))
     return false unless a.size == b.size
     a.each_with_index { |x, i| return false unless same?(x, b[i]) }
     return true
   end
-  a.class.to_s == b.class.to_s && a == b
+  a.class == b.class && a == b
 end
 
 # Selects *query* and checks that a plain `read` answers *expected*.
@@ -52,41 +50,41 @@ describe "PG::Decoders" do
 
   it "allows special-case casting on simple arrays" do
     value = PG_DB.query_one("select '{}'::integer[]") { |rs| rs.read(Array(Int32)) }.or_panic
-    assert typeof(value).to_s == (Array(Int32)).to_s
+    assert typeof(value) == Array(Int32)
     assert value.empty?
 
     value = PG_DB.query_one("select '{1,2,3}'::integer[]") { |rs| rs.read(Array(Int32)) }.or_panic
-    assert typeof(value).to_s == (Array(Int32)).to_s
+    assert typeof(value) == Array(Int32)
     assert value == [1, 2, 3]
 
     value2 = PG_DB.query_one("select '{1,2,3,null}'::integer[]") { |rs| rs.read(Array(Int32 | Nil)) }.or_panic
-    assert typeof(value2).to_s == (Array(Int32 | Nil)).to_s
+    assert typeof(value2) == Array(Int32 | Nil)
     assert value2 == [1, 2, 3, nil]
 
     value3 = PG_DB.query_one("select '{{1,2,3},{4,5,6}}'::integer[]") { |rs| rs.read(Array(Array(Int32))) }.or_panic
-    assert typeof(value3).to_s == (Array(Array(Int32))).to_s
+    assert typeof(value3) == Array(Array(Int32))
     assert value3 == [[1, 2, 3], [4, 5, 6]]
   end
 
   it "reads array as nilable" do
     value = PG_DB.query_one("select '{1,2,3}'::integer[]") { |rs| rs.read(Array(Int32) | Nil) }.or_panic
-    assert typeof(value).to_s == (Array(Int32) | Nil).to_s
+    assert typeof(value) == (Array(Int32) | Nil)
     assert value == [1, 2, 3]
 
     value = PG_DB.query_one("select null") { |rs| rs.read(Array(Int32) | Nil) }.or_panic
-    assert typeof(value).to_s == (Array(Int32) | Nil).to_s
+    assert typeof(value) == (Array(Int32) | Nil)
     assert value.nil?
   end
 
   it "reads arrray of numeric" do
     value = PG_DB.query_one("select '{1,2,3}'::numeric[]") { |rs| rs.read(Array(Numeric)) }.or_panic
-    assert typeof(value).to_s == (Array(Numeric)).to_s
+    assert typeof(value) == Array(Numeric)
     assert value.map(&.to_f) == [1.0, 2.0, 3.0]
   end
 
   it "reads arrray of nilable numeric" do
     value = PG_DB.query_one("select '{1,null,3}'::numeric[]") { |rs| rs.read(Array(Numeric | Nil)) }.or_panic
-    assert typeof(value).to_s == (Array(Numeric | Nil)).to_s
+    assert typeof(value) == Array(Numeric | Nil)
     assert value.map { |n| n ? n.to_f : nil } == [1.0, nil, 3.0]
   end
 
@@ -97,7 +95,7 @@ describe "PG::Decoders" do
 
   it "reads array of time" do
     values = PG_DB.query_one("select array[to_date('20170103', 'YYYYMMDD')::timestamp]") { |rs| rs.read(Array(Time)) }.or_panic
-    assert typeof(values).to_s == (Array(Time)).to_s
+    assert typeof(values) == Array(Time)
 
     assert values.size == 1
     assert values[0] == Time.utc(2017, 1, 3)
@@ -105,7 +103,7 @@ describe "PG::Decoders" do
 
   it "reads array of date" do
     values = PG_DB.query_one("select array[to_date('20170103', 'YYYYMMDD')]") { |rs| rs.read(Array(Time)) }.or_panic
-    assert typeof(values).to_s == (Array(Time)).to_s
+    assert typeof(values) == Array(Time)
 
     assert values.size == 1
     assert values[0] == Time.utc(2017, 1, 3)
@@ -113,7 +111,7 @@ describe "PG::Decoders" do
 
   it "reads array of uuid" do
     values = PG_DB.query_one("select array['56d3839e-dbb6-4b51-aa67-c0bc2a78c9d4'::uuid]") { |rs| rs.read(Array(UUID)) }.or_panic
-    assert typeof(values).to_s == (Array(UUID)).to_s
+    assert typeof(values) == Array(UUID)
 
     assert values.size == 1
     assert values[0] == UUID.parse("56d3839e-dbb6-4b51-aa67-c0bc2a78c9d4")
