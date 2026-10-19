@@ -1,0 +1,123 @@
+# TLS for a connection, over std/tls: the `TlsConfig` a `ConnInfo` asks
+# for, and the server certificate's hash that SCRAM-SHA-256-PLUS binds the
+# exchange to.
+#
+# std/tls checks every server's certificate - its chain to a root and the
+# host name - and has no way to turn either off. So a certificate is
+# checked whatever the `sslmode`: `require` and `prefer` check it against
+# `sslrootcert`, the root file (`~/.postgresql/root.crt`), or, without
+# one, the system's roots, where libpq would check nothing; `verify-ca`
+# checks the host name as `verify-full` does.
+#
+# https://www.postgresql.org/docs/current/libpq-ssl.html
+module pg/pq/ssl
+
+import std/env
+import std/file
+import std/path::{Path}
+import std/digest::{SHA224, SHA256, SHA384, SHA512}
+import std/tls::{TlsConfig, TlsIdentity, TlsVersion, TlsError}
+import std/x509::{Certificate, X509Error}
+import pg/pq/conninfo::{ConnInfo}
+import pg/pq/errors::{ConnectionError}
+
+# Where libpq looks for `root.crt`, `postgresql.crt` and `postgresql.key`
+# when no parameter names them: `~/.postgresql`, `%APPDATA%\postgresql`
+# on Windows; nil when there is no such directory to name.
+pub def postgresql_dir : String?
+  {% if flag?(:win32) %}
+    if appdata = ENV["APPDATA"]?
+      File.join(appdata, "postgresql")
+    end
+  {% else %}
+    Path["~/.postgresql"].expand(home: true).to_s
+  {% end %}
+end
+
+# What a TLS session for *conninfo* checks and presents: the roots its
+# server's chain must reach (`roots`), the client certificate it sends a
+# server that asks (`identity`), and the oldest version it speaks.
+pub def tls_config(conninfo : ConnInfo) : TlsConfig | ConnectionError
+  config = TlsConfig.new
+  config.min_version = conninfo.ssl_min_protocol_version == "TLSv1.3" ? TlsVersion::TLS13 : TlsVersion::TLS12
+  config.roots = roots(conninfo)!
+  config.identity = identity(conninfo)!
+  config
+end
+
+# The roots in `sslrootcert`, or in the root file when it is not given;
+# nil, the system's, for `sslrootcert=system`, and for `require` and
+# `prefer` with no root file. `verify-ca` and `verify-full` without one
+# are refused, as libpq refuses them: trusting the system's roots is asked
+# for by name.
+pub def roots(conninfo : ConnInfo) : Array(Certificate)? | ConnectionError
+  rootcert = conninfo.sslrootcert
+  return nil if rootcert == "system"
+  path = rootcert || default_file("root.crt")
+  unless path && File.exists?(path)
+    return nil unless conninfo.sslmode.in?(:"verify-ca", :"verify-full")
+    return ConnectionError.new(
+      "root certificate file #{(path || "root.crt").inspect} does not exist: name one with sslrootcert, " \
+      "trust the system's roots with sslrootcert=system, or choose an sslmode that does not ask for verification")
+  end
+  text = read_file(path, "root certificate file")!
+  certificates = Certificate.from_pem(text)
+  if certificates.is_a?(X509Error)
+    return ConnectionError.new("could not read root certificate file #{path.inspect}: #{certificates.message}")
+  end
+  return ConnectionError.new("root certificate file #{path.inspect} holds no certificate") if certificates.empty?
+  certificates
+end
+
+# The certificate and key in `sslcert` and `sslkey`, or in
+# `postgresql.crt` and `postgresql.key` when they are not given; nil when
+# there is no certificate file, as libpq sends none then.
+pub def identity(conninfo : ConnInfo) : TlsIdentity? | ConnectionError
+  cert_path = conninfo.sslcert || default_file("postgresql.crt")
+  return nil unless cert_path && File.exists?(cert_path)
+  key_path = conninfo.sslkey || default_file("postgresql.key")
+  unless key_path && File.exists?(key_path)
+    return ConnectionError.new("certificate present, but not private key file #{(key_path || "postgresql.key").inspect}")
+  end
+  identity = TlsIdentity.from_pem(read_file(cert_path, "certificate file")!, read_file(key_path, "private key file")!)
+  if identity.is_a?(TlsError)
+    return ConnectionError.new("could not load certificate #{cert_path.inspect} and key #{key_path.inspect}: #{identity.message}")
+  end
+  identity
+end
+
+# The `tls-server-end-point` channel binding (RFC 5929 section 4.1): the
+# server's *certificate* hashed under its signature's hash, SHA-256 for
+# MD5 and SHA-1. Nil for a signature that names no hash of its own
+# (Ed25519) or names it in its parameters (RSASSA-PSS), which this does
+# not read.
+pub def server_end_point(certificate : Certificate) : Array(UInt8)?
+  der = certificate.raw
+  case certificate.signature_algorithm
+  when "1.2.840.113549.1.1.4", "1.2.840.113549.1.1.5", "1.2.840.10045.4.1",
+       "1.2.840.113549.1.1.11", "1.2.840.10045.4.3.2"
+    SHA256.hash_bytes(der)
+  when "1.2.840.113549.1.1.14", "1.2.840.10045.4.3.1"
+    SHA224.hash_bytes(der)
+  when "1.2.840.113549.1.1.12", "1.2.840.10045.4.3.3"
+    SHA384.hash_bytes(der)
+  when "1.2.840.113549.1.1.13", "1.2.840.10045.4.3.4"
+    SHA512.hash_bytes(der)
+  else
+    nil
+  end
+end
+
+def default_file(name : String) : String?
+  if dir = postgresql_dir
+    File.join(dir, name)
+  end
+end
+
+# File.read panics on a file it cannot read; this answers why instead.
+def read_file(path : String, what : String) : String | ConnectionError
+  unless File.file?(path) && File.readable?(path)
+    return ConnectionError.new("could not read #{what} #{path.inspect}")
+  end
+  File.read(path)
+end

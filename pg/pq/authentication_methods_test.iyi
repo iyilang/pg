@@ -116,7 +116,7 @@ if ENV["RUN_AUTH_SPECS"]?
     end
   end
 
-  # "ssl clientcert auth" is omitted: iyi has no TLS (crystal-pg marks it pending too).
+  # "ssl clientcert auth" is in pg/pq/ssl_test.iyi, which needs a server with TLS.
 
   describe "PQ::Connection cleartext auth" do
     it "fails by default" do
@@ -168,6 +168,26 @@ describe "PQ scram primitives" do
     assert ctx.verify_server_signature("v=3HO6Qt1M4MKJrmlKaoOqLAI0/0TV0HZe7J9H3MBtSOg=").nil?
     # The RFC's own signature belongs to user "user", not "".
     assert ctx.verify_server_signature("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=").is_a?(DBError)
+  end
+
+  # The same exchange bound to a channel, and the "y" header of a client
+  # that could have bound it; the answers computed independently.
+  it "binds the exchange to the channel (SCRAM-SHA-256-PLUS)" do
+    binding = Array.new(32) { |i| i.to_u8 }
+    ctx = SaslContext.new("pencil", "rOprNGfwEbeRWgbNEkqO", binding: binding)
+    assert ctx.name == "SCRAM-SHA-256-PLUS"
+    assert ctx.client_first_msg == "p=tls-server-end-point,,n=,r=rOprNGfwEbeRWgbNEkqO", ctx.client_first_msg
+    server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    final = ctx.generate_client_final_message(server_first)
+    assert final == "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=Q8h71kjaoMzNI7dPksDrhRE/5mTUObF0fUHVIgBOWQg=", final.to_s
+    assert ctx.verify_server_signature("v=ykwoqH8mLqO5AQCeuwwf6lsj9f8zyJZT/CcvAbN4Ssc=").nil?
+
+    unbound = SaslContext.new("pencil", "rOprNGfwEbeRWgbNEkqO", binding_possible: true)
+    assert unbound.name == "SCRAM-SHA-256"
+    assert unbound.client_first_msg == "y,,n=,r=rOprNGfwEbeRWgbNEkqO", unbound.client_first_msg
+    final = unbound.generate_client_final_message(server_first)
+    assert final == "c=eSws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=VpuC5DGQa5ro9tXE9MnKs69NH1nxnuregZZcclqIGfM=", final.to_s
+    assert unbound.verify_server_signature("v=FOmOj9BpTGwvnzwBtWQjBaPmVxT9I8IeHBOhcIPu3us=").nil?
   end
 
   it "refuses a server nonce that does not extend the client's" do

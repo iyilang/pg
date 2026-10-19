@@ -91,6 +91,26 @@ describe "PQ::ConnInfo.from_conninfo_string" do
     nil
   end
 
+  it "TLS parameters" do
+    ci = parse("postgres://user:pass@localhost/foo")
+    assert ci.channel_binding == :prefer
+    assert ci.ssl_min_protocol_version == "TLSv1.2"
+    ci = parse("postgres://user:pass@localhost/foo?channel_binding=require&ssl_min_protocol_version=TLSv1.3")
+    assert ci.channel_binding == :require
+    assert ci.ssl_min_protocol_version == "TLSv1.3"
+    assert parse("host=localhost channel_binding=disable").channel_binding == :disable
+    expect_error(ConnInfo.from_conninfo_string("postgres://localhost/foo?channel_binding=always"), ArgumentError)
+    expect_error(ConnInfo.from_conninfo_string("postgres://localhost/foo?ssl_min_protocol_version=TLSv1.1"), ArgumentError)
+    nil
+  end
+
+  it "takes sslrootcert=system to mean verify-full unless an sslmode is given" do
+    assert parse("postgres://localhost/foo?sslrootcert=system").sslmode == :"verify-full"
+    assert parse("host=localhost sslrootcert=system").sslmode == :"verify-full"
+    assert parse("postgres://localhost/foo?sslrootcert=system&sslmode=prefer").sslmode == :prefer
+    assert parse("postgres://localhost/foo?sslrootcert=root.crt").sslmode == :prefer
+  end
+
   it "uses environment variables" do
     env_var_bubble do
       ENV["PGDATABASE"] = "A"

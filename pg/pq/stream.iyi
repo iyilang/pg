@@ -1,7 +1,8 @@
 # Big-endian byte sources: the buffered socket stream the protocol reads and
 # writes, and bytes in memory that a decoder reads the same way.
-# crystal-pg wrote straight to its `TCPSocket` with `sync = false` and
-# decoded from `IO`s; iyi's socket has no buffer of its own, so this is it.
+# crystal-pg wrote straight to its `TCPSocket` (or its `OpenSSL::SSL::Socket`)
+# with `sync = false` and decoded from `IO`s; iyi's socket has no buffer of
+# its own, so this is it, over the socket or the TLS session over it.
 #
 # Every read answers `StreamError` when the bytes asked for are not there:
 # the socket failed, or the source ended first.
@@ -10,6 +11,7 @@ module pg/pq/stream
 import std/int
 import std/float
 import std/socket::{IyiSocket, SocketError}
+import std/tls::{TlsClient, TlsError}
 import std/slice::{Slice, Bytes}
 import pg/pq/errors::{StreamError}
 
@@ -128,11 +130,13 @@ pub class MemorySource < ByteSource
   end
 end
 
-# A buffered stream over a socket. Writes collect in memory until `flush`.
+# A buffered stream over a socket, or over a TLS session on it once
+# `start_tls` has been called. Writes collect in memory until `flush`.
 pub class Stream < ByteSource
   BUFFER_SIZE = 16384
 
   @socket : IyiSocket
+  @tls : TlsClient? = nil
   @rbuf : Bytes
   @rpos = 0
   @rlen = 0
@@ -150,12 +154,39 @@ pub class Stream < ByteSource
     @socket
   end
 
-  def closed? : Bool
-    @socket.closed?
+  # The TLS session the stream reads and writes through, if there is one.
+  def tls : TlsClient?
+    @tls
   end
 
+  # Reads and writes through *tls*, a session over this stream's socket,
+  # from here on.
+  def start_tls(tls : TlsClient) : Nil
+    @tls = tls
+  end
+
+  # Whether bytes were read and are not yet taken: after the server's
+  # answer to an SSLRequest none may be, or they came unencrypted and
+  # would be taken as the session's (CVE-2021-23222).
+  def buffered? : Bool
+    @rpos < @rlen
+  end
+
+  def closed? : Bool
+    if tls = @tls
+      tls.closed? || @socket.closed?
+    else
+      @socket.closed?
+    end
+  end
+
+  # Closes the socket, after TLS's close_notify when there is a session.
   def close : Nil
-    @socket.close
+    if tls = @tls
+      tls.close
+    else
+      @socket.close
+    end
   end
 
   # How many bytes have been read from the stream so far.
@@ -168,7 +199,17 @@ pub class Stream < ByteSource
   # Reads at least one byte into the buffer; nothing when it holds some.
   private def fill : Nil | StreamError
     return nil if @rpos < @rlen
-    return StreamError.new("Socket is closed") if @socket.closed?
+    return StreamError.new("Socket is closed") if closed?
+    if tls = @tls
+      chunk = tls.read(@rbuf.size)
+      return StreamError.new("TLS error: #{chunk.message}") if chunk.is_a?(TlsError)
+      return StreamError.new("Unexpected end of stream from server") if chunk.empty?
+      @rbuf.to_unsafe.copy_from(chunk.to_unsafe, chunk.bytesize)
+      @base += @rlen
+      @rpos = 0
+      @rlen = chunk.bytesize
+      return nil
+    end
     n = @socket.read(@rbuf.to_unsafe, @rbuf.size)
     case n
     when Int32
@@ -203,7 +244,7 @@ pub class Stream < ByteSource
   def read_fully(target : Pointer(UInt8), count : Int32) : Nil | StreamError
     done = 0
     while done < count
-      if @rpos == @rlen && count - done >= @rbuf.size
+      if @tls.nil? && @rpos == @rlen && count - done >= @rbuf.size
         # a big read goes straight to its target
         return StreamError.new("Socket is closed") if @socket.closed?
         n = @socket.read(target + done, count - done)
@@ -316,7 +357,14 @@ pub class Stream < ByteSource
   # Sends what was written.
   def flush : Nil | StreamError
     return nil if @wlen == 0
-    return StreamError.new("Socket is closed") if @socket.closed?
+    return StreamError.new("Socket is closed") if closed?
+    if tls = @tls
+      size = @wlen
+      @wlen = 0
+      sent = tls.write(String.new(size) { |buffer| buffer.copy_from(@wbuf.to_unsafe, size) })
+      return StreamError.new("TLS error: #{sent.message}") if sent.is_a?(TlsError)
+      return nil
+    end
     n = @socket.write(@wbuf.to_unsafe, @wlen)
     @wlen = 0
     case n

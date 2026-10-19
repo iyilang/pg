@@ -1,0 +1,141 @@
+# Connections over TLS, against a server that has it: `SSL_ROOT_CERT`
+# names the root its certificate chains to, a certificate for 127.0.0.1.
+# Without it, nothing here runs.
+#
+# crystal-pg's "ssl clientcert auth" runs with RUN_AUTH_SPECS as well, and
+# SSL_CLIENT_CERT and SSL_CLIENT_KEY naming a certificate for the role
+# `crystal_cert` from that root, and these pg_hba.conf lines before the
+# others:
+#
+#     hostssl   all crystal_cert     all cert
+#     hostnossl all crystal_ssl_only all reject
+module pg/pq/ssl_test
+
+import std/env
+import std/uri::{URI}
+import db/db/db
+import db/db/errors::*
+import db/db/spec::{describe}
+import pg/testing/spec_helper::*
+
+PORT = ENV["PGPORT"]? || "5432"
+
+# db/db/spec's `it` runs its example as a task, and in a debug build of iyi
+# 0.18.0 a handshake overruns a task's 256 KiB stack: std/ecdsa's check of
+# one signature takes about 230 KB of it (iyilang/iyi#130). So these run on
+# the main fiber, where a failed `assert` ends the program, file and line
+# said.
+def example(name : String, & : -> Nil) : Nil
+  yield
+end
+
+# DB_URL with *query* in place of its own.
+def with_query(query : String) : String
+  uri = URI.parse(DB_URL)
+  uri.query = query
+  uri.to_s
+end
+
+def role_url(role : String, root : String, query : String) : String
+  database = PG_DB.query_one("select current_database()", as: String).or_panic
+  "postgres://#{role}:pass@127.0.0.1:#{PORT}/#{database}?sslrootcert=#{root}&#{query}"
+end
+
+# Whether the session *url* opens is encrypted; panics when it is refused.
+def encrypted?(url : String) : Bool
+  ssl = false
+  ::Db::Db.open(url) do |db|
+    ssl = db.query_one("select ssl from pg_stat_ssl where pid = pg_backend_pid()", as: Bool).or_panic
+  end.or_panic
+  ssl
+end
+
+# Why the session *url* opens is refused.
+def refusal(url : String) : String
+  result = ::Db::Db.open(url) { |_| nil }
+  raise "#{url} was not refused" unless result.is_a?(ConnectionRefused)
+  cause = result.cause
+  cause.nil? ? result.message : cause.message
+end
+
+if root = ENV["SSL_ROOT_CERT"]?
+  describe "PQ::Connection sslmode" do
+    example "verifies the server's certificate" do
+      assert encrypted?(with_query("sslmode=verify-full&sslrootcert=#{root}"))
+      assert encrypted?(with_query("sslmode=verify-ca&sslrootcert=#{root}"))
+      assert encrypted?(with_query("sslmode=require&sslrootcert=#{root}"))
+      assert encrypted?(with_query("sslrootcert=#{root}&ssl_min_protocol_version=TLSv1.3"))
+    end
+
+    example "prefers TLS, and goes on without it when the certificate is not trusted" do
+      assert encrypted?(with_query("sslrootcert=#{root}"))
+      # the test root is not among the system's
+      assert !encrypted?(with_query("sslmode=prefer&sslrootcert=system"))
+    end
+
+    example "refuses a certificate it cannot trust when TLS is required" do
+      cause = refusal(with_query("sslrootcert=system"))
+      assert cause.includes?("TLS handshake failed") && cause.includes?("not trusted"), cause
+    end
+
+    example "refuses verify-full without a root to verify against" do
+      cause = refusal(with_query("sslmode=verify-full&sslrootcert=#{root}.missing"))
+      assert cause.includes?("does not exist"), cause
+    end
+
+    example "connects unencrypted for disable and allow" do
+      assert !encrypted?(with_query("sslmode=disable"))
+      assert !encrypted?(with_query("sslmode=allow"))
+    end
+  end
+
+  describe "PQ::Connection channel_binding" do
+    example "binds SCRAM to the channel when required" do
+      assert encrypted?(with_query("sslmode=verify-full&sslrootcert=#{root}&channel_binding=require"))
+    end
+
+    example "refuses channel_binding=require without TLS" do
+      cause = refusal(with_query("sslmode=disable&channel_binding=require"))
+      assert cause.includes?("the connection is not encrypted"), cause
+    end
+
+    example "refuses channel_binding=require when auth_methods leaves out scram-sha-256-plus" do
+      cause = refusal(with_query("sslrootcert=#{root}&channel_binding=require&auth_methods=scram-sha-256"))
+      assert cause.includes?("auth_methods does not name scram-sha-256-plus"), cause
+    end
+
+    example "authenticates without binding when it is disabled" do
+      assert encrypted?(with_query("sslrootcert=#{root}&channel_binding=disable"))
+      assert encrypted?(with_query("sslrootcert=#{root}&auth_methods=scram-sha-256"))
+    end
+  end
+
+  if ENV["RUN_AUTH_SPECS"]? && (cert = ENV["SSL_CLIENT_CERT"]?) && (key = ENV["SSL_CLIENT_KEY"]?)
+    describe "PQ::Connection ssl clientcert auth" do
+      example "authenticates by the client's certificate" do
+        PG_DB.exec("drop role if exists crystal_cert").or_panic
+        PG_DB.exec("create role crystal_cert login").or_panic
+        assert encrypted?(role_url("crystal_cert", root, "sslmode=verify-full&sslcert=#{cert}&sslkey=#{key}"))
+        cause = refusal(role_url("crystal_cert", root, "sslmode=verify-full&sslcert=#{cert}.missing"))
+        assert cause.includes?("certificate"), cause
+        cause = refusal(role_url("crystal_cert", root, "sslcert=#{cert}&sslkey=#{key}&channel_binding=require"))
+        assert cause.includes?("without a password exchange"), cause
+        PG_DB.exec("drop role if exists crystal_cert").or_panic
+        nil
+      end
+    end
+
+    describe "PQ::Connection sslmode=allow" do
+      example "tries TLS when the server refuses the session without it" do
+        PG_DB.exec("drop role if exists crystal_ssl_only").or_panic
+        PG_DB.exec("create role crystal_ssl_only login password 'pass'").or_panic
+        assert encrypted?(role_url("crystal_ssl_only", root, "sslmode=allow"))
+        refusal(role_url("crystal_ssl_only", root, "sslmode=disable"))
+        PG_DB.exec("drop role if exists crystal_ssl_only").or_panic
+        nil
+      end
+    end
+  end
+else
+  puts "pg/pq/ssl_test: SSL_ROOT_CERT is not set; the TLS specs are skipped"
+end

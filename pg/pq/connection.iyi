@@ -9,9 +9,9 @@ module pg/pq/connection
 
 import std/int
 import std/text
-import std/path::{Path}
 import std/file
 import std/socket::{IyiSocket, SocketError}
+import std/tls::{TlsClient, TlsConfig, TlsError}
 import std/slice::{Slice, Bytes}
 import db/db/errors::{DBError}
 import pg/pq/errors::*
@@ -20,6 +20,7 @@ import pg/pq/conninfo::{ConnInfo}
 import pg/pq/frame::*
 import pg/pq/param::{Param}
 import pg/pq/scram::{SaslContext, md5_password}
+import pg/pq/ssl::{tls_config, server_end_point}
 import pg/pq/pgpass::{LOG}
 # Imported unnamed: its `Frame` is not `pg/pq/frame`'s, so it is written
 # out in full below.
@@ -39,30 +40,110 @@ pub class PQConnection
     @notification_handler = ->(notification : Notification) { nil }
   end
 
-  # Opens the socket *conninfo* names: a Unix socket in the directory its
-  # host names when that is a path, TCP otherwise.
-  #
-  # iyi has no TLS, so SSL is never negotiated: `sslmode` `prefer` and
-  # `allow` go on unencrypted, as libpq does when the server declines,
-  # and `require`, `verify-ca` and `verify-full` are refused here.
-  def self.open(conninfo : ConnInfo) : PQConnection | ConnectionError
-    if conninfo.sslmode.in?(:require, :"verify-ca", :"verify-full")
-      return ConnectionError.new("sslmode=#{conninfo.sslmode} needs TLS, which this driver does not support")
-    end
+  # The code an SSLRequest sends where a startup message sends its
+  # protocol version.
+  SSL_REQUEST_CODE = 80877103
 
-    socket = if Path.new(conninfo.host).absolute? && conninfo.host.starts_with?('/')
-               socket_path = File.join(conninfo.host, ".s.PGSQL.#{conninfo.port}")
-               IyiSocket.connect_unix(socket_path)
+  # The session *conninfo* describes, started and authenticated, encrypted
+  # as its `sslmode` asks: `disable` never; `prefer` when the server takes
+  # TLS and its certificate is trusted, unencrypted otherwise; `require`,
+  # `verify-ca` and `verify-full` always; `allow` unencrypted, and again
+  # over TLS when the server refuses that. A Unix socket is never
+  # encrypted, whatever the mode, as libpq has it.
+  def self.establish(conninfo : ConnInfo) : PQConnection | DBError
+    case conninfo.sslmode
+    when :disable
+      start(conninfo, :off)
+    when :allow
+      first = start(conninfo, :off)
+      return first unless first.is_a?(PQError) && !conninfo.unix_socket?
+      LOG.debug { "The server refused an unencrypted session (#{first.message}): trying TLS" }
+      start(conninfo, :must)
+    when :prefer
+      start(conninfo, :try)
+    else
+      start(conninfo, :must)
+    end
+  end
+
+  # Opens and starts a session, *ssl* as `open` takes it.
+  private def self.start(conninfo : ConnInfo, ssl : Symbol) : PQConnection | DBError
+    pq = open(conninfo, ssl)!
+    connected = pq.connect(conninfo.replication)
+    if connected.is_a?(DBError)
+      pq.close
+      return connected
+    end
+    pq
+  end
+
+  # Opens the socket *conninfo* names - a Unix socket in the directory its
+  # host names when that is a path, TCP otherwise - and over TCP asks for
+  # TLS as *ssl* says: `:off` not at all, `:must` with no session without
+  # it, `:try` going on unencrypted when the server declines or the
+  # handshake fails.
+  def self.open(conninfo : ConnInfo, ssl : Symbol = :off) : PQConnection | DBError
+    unix = conninfo.unix_socket?
+    # The configuration first: a root or client certificate that cannot be
+    # read is the caller's to fix before any server is asked anything.
+    config = unix || ssl == :off ? nil : tls_config(conninfo)!
+
+    socket = if unix
+               IyiSocket.connect_unix(File.join(conninfo.host, ".s.PGSQL.#{conninfo.port}"))
              else
                IyiSocket.connect(conninfo.host, conninfo.port)
              end
     case socket
     when IyiSocket
-      PQConnection.new(Stream.new(socket), conninfo)
+      pq = PQConnection.new(Stream.new(socket), conninfo)
+      return pq unless config
+      encrypted = pq.request_tls(config)
+      return pq if encrypted == true || (encrypted == false && ssl == :try)
+      pq.stream.socket.close unless pq.stream.socket.closed?
+      case encrypted
+      when TlsError
+        return ConnectionError.new("TLS handshake failed: #{encrypted.message}") if ssl == :must
+        LOG.debug { "TLS handshake failed (#{encrypted.message}): connecting unencrypted" }
+        open(conninfo, :off)
+      when DBError
+        encrypted
+      else
+        ConnectionError.new("the server does not support TLS, but sslmode=#{conninfo.sslmode} requires it")
+      end
     when SocketError
       ConnectionError.new("Cannot establish connection: #{socket.reason}")
     else
       ConnectionError.new("Cannot establish connection: cancelled")
+    end
+  end
+
+  # Asks the server for TLS (an SSLRequest) and, when it agrees, makes the
+  # session's handshake under *config*, checking its certificate for the
+  # host connected to: true once encrypted, false when the server declines,
+  # the `TlsError` of a failed handshake, or the server's error; on any of
+  # those but false the socket is the caller's to close.
+  def request_tls(config : TlsConfig) : Bool | TlsError | DBError
+    @stream.write_i32(8)
+    @stream.write_i32(SSL_REQUEST_CODE)
+    @stream.flush!
+    case answer = @stream.read_char!
+    when 'S'
+      if @stream.buffered?
+        return ConnectionError.new("the server sent unencrypted data after agreeing to TLS")
+      end
+      tls = TlsClient.over(@stream.socket, @conninfo.host, config)
+      return tls if tls.is_a?(TlsError)
+      @stream.start_tls(tls)
+      true
+    when 'N'
+      false
+    when 'E'
+      # The server failed before it could answer (it could not start a
+      # backend, say): its ErrorResponse follows.
+      error = read('E')
+      error.is_a?(DBError) ? error : ConnectionError.new("the server answered the SSLRequest with #{error}")
+    else
+      ConnectionError.new("the server answered the SSLRequest with #{answer.inspect}")
     end
   end
 
@@ -313,6 +394,14 @@ pub class PQConnection
   end
 
   private def handle_auth(auth_frame : Frame::Authentication) : Nil | DBError
+    if @conninfo.channel_binding == :require && auth_frame.type != Frame::Authentication::Type::SASL.value
+      # Nothing is sent to a server that has not proven it holds the
+      # channel, and no session it grants is taken.
+      how = auth_frame.type == Frame::Authentication::Type::OK.value ? "without a password exchange" : "with #{auth_type_name(auth_frame.type)}"
+      return ConnectionError.new(
+        "channel_binding=require, but the server would let the client in #{how}, which binds no channel"
+      )
+    end
     case auth_frame.type
     when Frame::Authentication::Type::OK.value
       # no op
@@ -350,17 +439,52 @@ pub class PQConnection
     nil
   end
 
+  # The server's `tls-server-end-point` binding, when the session is
+  # encrypted, `channel_binding` allows it, and the certificate's signature
+  # names a hash; nil otherwise, with why.
+  private def channel_binding_data : Array(UInt8) | String
+    return "channel_binding=disable" if @conninfo.channel_binding == :disable
+    tls = @stream.tls
+    return "the connection is not encrypted" if tls.nil?
+    certificate = tls.peer_certificates.first?
+    return "the server sent no certificate" if certificate.nil?
+    server_end_point(certificate) ||
+      "the server's certificate is signed under #{certificate.signature_algorithm}, whose hash tls-server-end-point does not name"
+  end
+
+  # SCRAM-SHA-256-PLUS when the server offers it and the channel can be
+  # bound (see `channel_binding_data`), SCRAM-SHA-256 otherwise, unless
+  # `channel_binding=require`.
   private def handle_auth_sasl(mechanism_list : String) : Nil | DBError
     mechs = mechanism_list.split('\0').reject(&.empty?)
-    unless mechs.includes?(SaslContext::SCRAM_NAME)
-      if mechs.includes?(SaslContext::SCRAM_PLUS_NAME)
-        return ConnectionError.new("the server offered only SCRAM-SHA-256-PLUS, which needs TLS")
-      end
-      return ConnectionError.new("no known sasl mechanism in list: #{mechs.join(", ")}")
-    end
-    check_auth_method("scram-sha-256")!
-
-    ctx = SaslContext.new(@conninfo.password || "")
+    binding = channel_binding_data
+    plus_offered = mechs.includes?(SaslContext::SCRAM_PLUS_NAME)
+    password = @conninfo.password || ""
+    ctx = if binding.is_a?(Array(UInt8)) && plus_offered && @conninfo.auth_methods.includes?("scram-sha-256-plus")
+            SaslContext.new(password, binding: binding)
+          else
+            if @conninfo.channel_binding == :require
+              why = if binding.is_a?(String)
+                      binding
+                    elsif !plus_offered
+                      "the server did not offer SCRAM-SHA-256-PLUS"
+                    else
+                      "auth_methods does not name scram-sha-256-plus"
+                    end
+              return ConnectionError.new("channel_binding=require, but the channel cannot be bound: #{why}")
+            end
+            unless mechs.includes?(SaslContext::SCRAM_NAME)
+              if plus_offered
+                return ConnectionError.new("the server offered only SCRAM-SHA-256-PLUS, and the channel cannot be bound: #{binding.is_a?(String) ? binding : "auth_methods does not name scram-sha-256-plus"}")
+              end
+              return ConnectionError.new("no known sasl mechanism in list: #{mechs.join(", ")}")
+            end
+            check_auth_method("scram-sha-256")!
+            # "y": this side could bind the channel, the server offered no
+            # way to - which the server refuses if it did offer one that a
+            # man in the middle took out of the list.
+            SaslContext.new(password, binding_possible: binding.is_a?(Array(UInt8)) && !plus_offered)
+          end
 
     # send client-first-message
     @stream.write_char('p') # SASLInitialResponse

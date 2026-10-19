@@ -18,6 +18,9 @@ pub struct ConnInfo
 
   SSL_MODES = [:disable, :allow, :prefer, :require, :"verify-ca", :"verify-full"]
 
+  # The `ssl_min_protocol_version`s std/tls speaks.
+  TLS_VERSIONS = ["TLSv1.2", "TLSv1.3"]
+
   # The host. If it starts with a / it is the directory of a local Unix
   # socket.
   getter host : String
@@ -43,8 +46,17 @@ pub struct ConnInfo
   # The sslkey. Optional.
   getter sslkey : String?
 
-  # The sslrootcert. Optional.
+  # The sslrootcert: a PEM file of the roots a server's certificate must
+  # chain to, or `"system"` for the system's. Optional.
   getter sslrootcert : String?
+
+  # Whether SCRAM binds itself to the TLS channel (SCRAM-SHA-256-PLUS):
+  # `:prefer` (when it can), `:require` or `:disable`.
+  getter channel_binding : Symbol
+
+  # The oldest TLS version spoken: `"TLSv1.2"` unless given, or
+  # `"TLSv1.3"`.
+  getter ssl_min_protocol_version : String
 
   # The application name. Optional (defaults to "crystal").
   getter application_name : String
@@ -70,6 +82,13 @@ pub struct ConnInfo
     @sslcert = nil
     @sslkey = nil
     @sslrootcert = nil
+    @channel_binding = :prefer
+    @ssl_min_protocol_version = "TLSv1.2"
+  end
+
+  # Whether `host` names the directory of a Unix socket.
+  def unix_socket? : Bool
+    Path.new(@host).absolute? && @host.starts_with?('/')
   end
 
   # From either a `postgres://` (or `postgresql://`) URL or a libpq
@@ -95,8 +114,8 @@ pub struct ConnInfo
 
   # From a `URI`: its host (or the `host` parameter), port, path as the
   # database, user and password, and `application_name`, `replication`,
-  # `sslmode`, `sslcert`, `sslkey`, `sslrootcert` and `auth_methods` from
-  # its query.
+  # `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, `channel_binding`,
+  # `ssl_min_protocol_version` and `auth_methods` from its query.
   def self.from_uri(uri : URI) : ConnInfo | DBError
     params = Params.parse(uri.query || "")
     hostname = (uri.hostname || "").presence || params["host"]? || ""
@@ -106,13 +125,14 @@ pub struct ConnInfo
       handled = info.handle_sslparam(key, value)
       return handled if handled.is_a?(DBError)
     end
+    info.default_sslmode(params["sslmode"]?)
     info
   end
 
   # From libpq "conninfo" keys: `"host"`, `"dbname"`, `"user"`,
   # `"password"`, `"port"`, `"sslmode"`, `"sslcert"`, `"sslkey"`,
-  # `"sslrootcert"`, `"application_name"`, `"replication"` and
-  # `"auth_methods"`.
+  # `"sslrootcert"`, `"channel_binding"`, `"ssl_min_protocol_version"`,
+  # `"application_name"`, `"replication"` and `"auth_methods"`.
   def self.from_hash(params : Hash(String, String)) : ConnInfo | DBError
     port = parse_port(params["port"]?)!
     info = ConnInfo.new(params["host"]?, params["dbname"]?, params["user"]?,
@@ -121,6 +141,7 @@ pub struct ConnInfo
       handled = info.handle_sslparam(key, value)
       return handled if handled.is_a?(DBError)
     end
+    info.default_sslmode(params["sslmode"]?)
     info
   end
 
@@ -138,6 +159,23 @@ pub struct ConnInfo
     end
   end
 
+  # The channel_binding *value* names, or `ArgumentError`.
+  def self.parse_channel_binding(value : String) : Symbol | DBError
+    case value
+    when "prefer"  then :prefer
+    when "disable" then :disable
+    when "require" then :require
+    else
+      ArgumentError.new("channel_binding #{value} not supported")
+    end
+  end
+
+  # `sslrootcert=system` without an `sslmode` means `verify-full`, as libpq
+  # has it: the system's roots are trusted for the host's name alone.
+  protected def default_sslmode(given : String?) : Nil
+    @sslmode = :"verify-full" if given.nil? && @sslrootcert == "system"
+  end
+
   protected def self.parse_port(port : String?) : Int32? | DBError
     return nil if port.nil? || port.empty?
     port.to_i? || ArgumentError.new("invalid port: #{port}")
@@ -153,6 +191,13 @@ pub struct ConnInfo
       @sslkey = value
     when "sslrootcert"
       @sslrootcert = value
+    when "channel_binding"
+      @channel_binding = ConnInfo.parse_channel_binding(value)!
+    when "ssl_min_protocol_version"
+      unless TLS_VERSIONS.includes?(value)
+        return ArgumentError.new("ssl_min_protocol_version #{value} not supported: TLSv1.2 and TLSv1.3 are")
+      end
+      @ssl_min_protocol_version = value
     when "auth_methods"
       methods = [] of String
       value.split(',').each do |method|

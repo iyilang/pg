@@ -405,13 +405,8 @@ pub class PGConnection < Connection
   # Opens the session *conn_info* describes; `ConnectionRefused`, with the
   # reason as its cause, when it cannot be established.
   def self.open(options : Connection::Options, conn_info : ConnInfo) : PGConnection | DBError
-    pq = PQConnection.open(conn_info)
+    pq = PQConnection.establish(conn_info)
     return ConnectionRefused.new(pq.message, pq) if pq.is_a?(DBError)
-    connected = pq.connect(conn_info.replication)
-    if connected.is_a?(DBError)
-      pq.close
-      return ConnectionRefused.new(connected.message, connected)
-    end
     PGConnection.new(options, pq)
   end
 

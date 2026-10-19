@@ -1,9 +1,10 @@
 # The password exchanges: SCRAM-SHA-256 (RFC 5802, RFC 7677) and the md5
-# challenge. crystal-pg took HMAC and PBKDF2 from OpenSSL; iyi has no TLS
-# library, so they are written here over `std/digest`'s SHA-256.
+# challenge. crystal-pg took HMAC and PBKDF2 from OpenSSL; here they are
+# written over `std/digest`'s SHA-256.
 #
-# SCRAM-SHA-256-PLUS binds the exchange to a TLS channel, and iyi has none,
-# so only the plain mechanism is offered.
+# SCRAM-SHA-256-PLUS binds the exchange to the TLS channel under it
+# (`tls-server-end-point`, RFC 5929, the binding PostgreSQL takes): a man
+# in the middle who ended TLS on both sides cannot relay it.
 module pg/pq/scram
 
 import std/int
@@ -69,11 +70,27 @@ pub class SaslContext
   getter client_first_msg : String
   @client_nonce : String
   @server_sig : String?
+  # The GS2 header (RFC 5802 section 7): `p=tls-server-end-point` when the
+  # exchange is bound, `y` when the client could bind it and the server
+  # offered no way to, `n` when the client cannot.
+  @gs2_header : String
+  @binding : Array(UInt8)
 
-  def initialize(@password : String, nonce : String? = nil)
+  # An exchange bound to *binding*, the server's `tls-server-end-point`
+  # data, when there is one (SCRAM-SHA-256-PLUS); unbound otherwise,
+  # *binding_possible* saying whether it could have been.
+  def initialize(@password : String, nonce : String? = nil, binding : Array(UInt8)? = nil, binding_possible : Bool = false)
     @client_nonce = nonce || SaslContext.nonce
-    @name = SCRAM_NAME
-    @client_first_msg = "n,,n=,r=#{@client_nonce}"
+    if binding
+      @name = SCRAM_PLUS_NAME
+      @gs2_header = "p=tls-server-end-point,,"
+      @binding = binding
+    else
+      @name = SCRAM_NAME
+      @gs2_header = binding_possible ? "y,," : "n,,"
+      @binding = [] of UInt8
+    end
+    @client_first_msg = "#{@gs2_header}n=,r=#{@client_nonce}"
     @server_sig = nil
   end
 
@@ -102,8 +119,10 @@ pub class SaslContext
       return ConnectionError.new("SASL: scram server nonce does not start with client nonce")
     end
 
-    # biws == base64 of "n,,"
-    client_final_msg_without_proof = "c=biws,r=#{r}"
+    # the GS2 header and the channel binding data: biws, base64 of "n,,",
+    # when there is no binding
+    channel = Base64.encode(@gs2_header + bytes_string(@binding))
+    client_final_msg_without_proof = "c=#{channel},r=#{r}"
     salted_pass = pbkdf2_sha256(@password, Base64.decode(s), iterations)
     server_key = hmac_sha256(salted_pass, "Server Key")
     client_key = hmac_sha256(salted_pass, "Client Key")
