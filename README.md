@@ -67,13 +67,22 @@ end
 The URI's query takes iyi-db's pool options (`max_pool_size`, ...) and the
 connection's: `application_name`, `sslmode`, `sslrootcert`, `sslcert`,
 `sslkey`, `ssl_min_protocol_version`, `channel_binding`, `auth_methods`,
-`replication`, and `host` for a Unix socket directory. Missing parts come
-from `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGAPPNAME`
-and the password file (`~/.pgpass`, `%APPDATA%\postgresql\pgpass.conf` on
-Windows, or `PGPASSFILE`), as libpq takes them; the user is the account the
-program runs as, and the database the user's name. A host is a name,
-resolved by iyi's own resolver, or an address. A parameter this driver does
-not know is logged as ignored (iyi-db's pool options are known).
+`connect_timeout`, `options`, `replication`, and `host` for a Unix socket
+directory. A `key=value` string takes the same keys, a value with spaces
+single-quoted (`options='-c search_path=app'`). Missing parts come from
+`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGAPPNAME`,
+`PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGCHANNELBINDING`,
+`PGSSLMINPROTOCOLVERSION`, `PGCONNECT_TIMEOUT`, `PGOPTIONS` and the password
+file (`~/.pgpass`, `%APPDATA%\postgresql\pgpass.conf` on Windows, or
+`PGPASSFILE`), as libpq takes them; the user is the account the program
+runs as, and the database the user's name. A host is a name, resolved by
+iyi's own resolver, or an address. A parameter this driver does not know is
+logged as ignored (iyi-db's pool options are known).
+
+`connect_timeout` is in seconds, as libpq's (0 or less is none, 1 is 2), and
+bounds each attempt whole: the TCP connect, the TLS handshake, and the
+startup and authentication. `options` is sent to the server as the session's
+command-line options: `options=-c%20search_path%3Dapp`.
 
 A server error is a `PQError` (module `pg/pq/errors`) whose `fields` hold
 what the server sent: `err.field_message(:code)`, `:detail`, `:hint`, ...
@@ -147,16 +156,31 @@ whole program.
 
 ### Arrays
 
-The array types (bool, "char", int2, int4, int8, float4, float8, text,
-numeric, timestamp, timestamptz, date, uuid) read as nested `Array(DBValue)`,
-or as exactly the type asked for:
+Every array type of a type in the table below reads as nested
+`Array(DBValue)`, or as exactly the type asked for:
 
 ```iyi
 db.query_one("select ARRAY[1, null, 3]", as: Array(Int32 | Nil))! # => [1, nil, 3]
 db.query_one("select '{hello, world}'::text[]", as: Array(String))! # => ["hello", "world"]
 ```
 
-An array argument is sent in the array text format.
+An array argument is sent in the array text format. A typed read of an
+array of ranges is not there yet; a plain `read` answers it.
+
+### Cancelling a statement
+
+`PGConnection#cancel` asks the server to cancel what the connection is
+running, from another task; the statement then fails with SQLSTATE 57014.
+The request goes on a connection of its own, unencrypted whatever the
+`sslmode`, as libpq's before PostgreSQL 17. `backend_pid` is the server
+process's id.
+
+```iyi
+group do |g|
+  g.spawn { sleep(1000); conn.cancel.or_panic; 0 }
+  conn.exec("select pg_sleep(60)") # => PQError, field_message(:code) == "57014"
+end
+```
 
 ### Notices and errors
 
@@ -221,11 +245,17 @@ The server needs `wal_level=logical`. Without `group:`,
 | PostgreSQL | read as |
 |---|---|
 | text, varchar, bpchar, name, xml, unknown | `String` |
+| macaddr, macaddr8 | `String`: `08:00:2b:01:02:03` |
+| bit, varbit | `String` of `0`s and `1`s |
 | "char" | `Char` |
 | boolean | `Bool` |
 | int2, int4, int8, oid, regtype, pg_lsn | `Int16`, `Int32`, `Int64`, `UInt32`, `Int32`, `UInt64` |
+| money | `Int64`, the amount in the currency's minor unit (cents) |
 | float4, float8 | `Float32`, `Float64` |
 | timestamptz, timestamp, date | `Time` (UTC) |
+| time | `Span` since midnight |
+| timetz | `TimeTz`: `time` (`Span`) and `offset` (seconds east of UTC) |
+| inet, cidr | `Inet`: a `std/netip` `Prefix`, and `cidr?` |
 | json, jsonb | `JSONValue`; `read(JSON::Any)` parses it |
 | uuid | `UUIDValue`; `read(UUID)` answers the `std/uuid` value |
 | bytea, and any OID without a decoder | `Bytes` |
@@ -233,7 +263,9 @@ The server needs `wal_level=logical`. Without `group:`,
 | interval | `Interval` (2) |
 | point, line, lseg, box, path, polygon, circle | `Point`, `Line`, `LineSegment`, `Box`, `Path`, `Polygon`, `Circle` |
 | record, and registered composite types | `Record` (3) |
-| the arrays above | `Array(DBValue)` or a typed `Array(T)` |
+| int4range, int8range, numrange, tsrange, tstzrange, daterange | `RangeValue` (4) |
+| their multiranges (PostgreSQL 14+) | `MultirangeValue` (4) |
+| the arrays of all of these | `Array(DBValue)` or a typed `Array(T)` |
 
 1: `Numeric` keeps every digit, and reads NaN and (PostgreSQL 14+)
 `Infinity` and `-Infinity`. `to_f` is approximate; `to_big_d` and `to_big_r`
@@ -249,11 +281,19 @@ answers a `Span` (with `approx_months:` for intervals with months), and
 own type. A named composite type has its own OID; register it with
 `Decoders.register_decoder RecordDecoder.new([oid])`.
 
+4: A `RangeValue` holds `lower` and `upper` (nil for an unbounded side),
+`lower_inclusive?`, `upper_inclusive?` and `empty?`; a discrete range reads
+in its canonical form, `[1,5]` as `[1,6)`. A `MultirangeValue` holds its
+`ranges`. A range type of your own registers with its subtype's OID:
+`Decoders.register_decoder RangeDecoder.new([oid], subtype_oid)`, and
+`MultirangeDecoder.new([multirange_oid], subtype_oid)` (module `pg/range`;
+the OIDs are in `pg_range`).
+
 Values bound as arguments are iyi-db's `DBValue`s: the scalars, `Time` (to
 the microsecond, PostgreSQL's precision), `Span`, `Bytes`, arrays, and this
 driver's value classes (`Numeric`, `Interval`, the geometric types,
-`UUIDValue`, `JSONValue`, `Record`). A statement takes at most 65535 of
-them.
+`UUIDValue`, `JSONValue`, `Record`, `TimeTz`, `Inet`, `RangeValue`,
+`MultirangeValue`). A statement takes at most 65535 of them.
 
 ## Authentication methods
 
@@ -305,7 +345,8 @@ mistake that postgres continues to have this as an option at all.
 | `pg` (the root module) | `Pg.connect`, `connect_listen`, `connect_replication`, `ListenConnection`, `VERSION` |
 | `pg/core` | `PGDriver`, `PGConnection`, `PGStatement`, `PGResultSet`, `PGConnectionBuilder`; registers the driver |
 | `pg/decoder` | `Decoder` and one per type, `Decoders` (`from_oid`, `register_decoder`), `UUIDValue`, `JSONValue` |
-| `pg/numeric`, `pg/interval`, `pg/geo`, `pg/record` | the value classes |
+| `pg/numeric`, `pg/interval`, `pg/geo`, `pg/record`, `pg/time_tz`, `pg/inet` | the value classes |
+| `pg/range` | `RangeValue`, `MultirangeValue`, `RangeDecoder`, `MultirangeDecoder` |
 | `pg/escape` | `EscapeHelper`: `escape_identifier`, `escape_literal` |
 | `pg/copy_result` | `CopyResult` |
 | `pg/replication` | logical replication: `Connection`, `Handler` |

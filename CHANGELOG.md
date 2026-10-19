@@ -1,3 +1,35 @@
+## v0.3.0
+
+Types, ranges and connection options crystal-pg does not have.
+
+* More types read: `time` as `Span`, `timetz` as `TimeTz`, `inet` and `cidr`
+  as `Inet` (over `std/netip`), `macaddr`/`macaddr8` and `bit`/`varbit` as
+  `String`, `money` as `Int64` in the minor unit. They read as `Bytes`
+  before. `TimeTz` and `Inet` bind as arguments.
+* The arrays of every type the driver reads: `varchar[]` (so
+  `array_agg(varchar_col)`), `bpchar[]`, `name[]`, `xml[]`, `bytea[]`,
+  `oid[]`, `json[]`/`jsonb[]`, `timestamptz[]`, `interval[]`, the geometric
+  arrays, `record[]` and the arrays of the new types. They read as `Bytes`
+  before. Typed reads (`Array(String)`, `Array(Interval)`, `Array(Bytes)`,
+  ...) cover them.
+* Range types (`pg/range`): the six built-in ranges read as `RangeValue`,
+  their multiranges (PostgreSQL 14+) as `MultirangeValue`, and their arrays;
+  both bind. `RangeDecoder` and `MultirangeDecoder` register a range type of
+  one's own.
+* `connect_timeout` (and `PGCONNECT_TIMEOUT`) bounds each connection
+  attempt: the TCP connect, the TLS handshake, and startup and
+  authentication. On Windows std/socket's connect ignores its timeout, so
+  the connect is cancelled at the deadline.
+* `options` (and `PGOPTIONS`) is sent as the session's command-line options.
+* `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGCHANNELBINDING`
+  and `PGSSLMINPROTOCOLVERSION` are read, a parameter given winning; a value
+  they cannot take is an `ArgumentError`.
+* A `key=value` string takes single-quoted values with `\'` and `\\`, and
+  spaces around `=`, as libpq does.
+* `PGConnection#cancel` cancels the running statement from another task (a
+  CancelRequest, unencrypted as libpq's before 17); `#backend_pid` is the
+  server process's id.
+
 ## v0.2.1
 
 Fixes from a comparison with crystal-pg, each with a test.
