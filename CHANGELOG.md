@@ -1,3 +1,10 @@
+## v0.3.1
+
+On iyi-db 0.3.0, for its pool and closing fixes: `Database#close` closes
+every connection, a closed pool refuses checkouts, a waiting checkout keeps
+to `checkout_timeout`, and an error closing what a query opened is
+answered. Nothing in this driver changes.
+
 ## v0.3.0
 
 Types, ranges and connection options crystal-pg does not have.
