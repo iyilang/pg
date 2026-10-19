@@ -1,3 +1,36 @@
+## v0.2.0
+
+On iyi 0.18.0, whose `std/tls` and resolver this release is built on; iyi
+0.17.0 is no longer enough.
+
+* TLS, over `std/tls`: `sslmode` `prefer` (the default) and `allow` negotiate
+  it as libpq does - `prefer` goes on unencrypted when the server declines or
+  the handshake fails, `allow` tries TLS when the server refuses an
+  unencrypted session - and `require`, `verify-ca` and `verify-full` insist
+  on it. A Unix socket is never encrypted. TLS 1.3, and 1.2 unless
+  `ssl_min_protocol_version=TLSv1.3`.
+* Every server certificate is checked, chain and host name, whatever the
+  `sslmode`: `std/tls` cannot be told not to. The roots are `sslrootcert`'s,
+  `~/.postgresql/root.crt`'s (`%APPDATA%\postgresql\root.crt` on Windows),
+  or, for `require` and `prefer` without either and for
+  `sslrootcert=system`, the system's. `sslrootcert=system` means
+  `verify-full` unless an `sslmode` is given; `verify-ca` and `verify-full`
+  without a root file are refused.
+* Client certificates: `sslcert` and `sslkey`, or
+  `~/.postgresql/postgresql.crt` and `postgresql.key`, sent to a server that
+  asks.
+* SCRAM-SHA-256-PLUS (`tls-server-end-point`) when the server offers it over
+  TLS, and `channel_binding` (`prefer`, `require`, `disable`).
+* Host names resolve: `std/socket` connects to a name through iyi's resolver.
+
+### Known issue
+
+* In a debug build of iyi 0.18.0 a TLS handshake run as a task can overrun
+  the task's 256 KiB stack (`std/ecdsa` takes about 230 KB of it for one
+  signature) and end in a memory fault or a certificate read as untrusted
+  ([iyi#130](https://github.com/iyilang/iyi/issues/130)). A `--release`
+  build, or the handshake on the main fiber, is not affected.
+
 ## v0.1.0
 
 The first release of iyi-pg: crystal-pg 0.31.0 ported to iyi, in iyi, on

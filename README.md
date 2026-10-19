@@ -8,13 +8,13 @@ speaks the PostgreSQL wire protocol (version 3) itself.
 
 It keeps crystal-pg's shape - `postgres://` URIs, binary results decoded by
 type OID, arrays, `numeric`, `interval`, the geometric types, LISTEN/NOTIFY,
-COPY, notices, SCRAM-SHA-256 and md5 authentication, logical replication -
-and changes what iyi's rules require: errors are values, types are closed,
-and tasks are structured.
+COPY, notices, SCRAM-SHA-256 and md5 authentication, TLS, logical
+replication - and changes what iyi's rules require: errors are values, types
+are closed, and tasks are structured.
 
 ## Requirements
 
-iyi 0.17.0 or later, and iyi-db 0.1.1 (required by this package's `iyi.mod`).
+iyi 0.18.0 or later, and iyi-db 0.1.1 (required by this package's `iyi.mod`).
 Tested against PostgreSQL 16.
 
 ## Installation
@@ -60,13 +60,57 @@ end
 ```
 
 The URI's query takes iyi-db's pool options (`max_pool_size`, ...) and the
-connection's: `application_name`, `sslmode`, `auth_methods`, `replication`,
-and `host` for a Unix socket directory. Missing parts come from `PGHOST`,
-`PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGAPPNAME` and the password
-file (`~/.pgpass` or `PGPASSFILE`), as libpq takes them.
+connection's: `application_name`, `sslmode`, `sslrootcert`, `sslcert`,
+`sslkey`, `ssl_min_protocol_version`, `channel_binding`, `auth_methods`,
+`replication`, and `host` for a Unix socket directory. Missing parts come
+from `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGAPPNAME`
+and the password file (`~/.pgpass` or `PGPASSFILE`), as libpq takes them. A
+host is a name, resolved by iyi's own resolver, or an address.
 
 A server error is a `PQError` (module `pg/pq/errors`) whose `fields` hold
 what the server sent: `err.field_message(:code)`, `:detail`, `:hint`, ...
+
+### TLS
+
+Over TCP, a session is encrypted with iyi's `std/tls` as `sslmode` says,
+libpq's way: `disable` never; `prefer`, the default, when the server takes
+TLS and its certificate is trusted, unencrypted otherwise; `allow`
+unencrypted, and over TLS when the server refuses that; `require`,
+`verify-ca` and `verify-full` always. A Unix socket is never encrypted.
+
+```iyi
+Db::Db.open("postgres://user:pass@db.example.com/mydb?sslmode=verify-full&sslrootcert=/etc/ssl/pg-root.crt")
+```
+
+`std/tls` checks every server's certificate - its chain to a root, and the
+host name - and cannot be told not to, so this driver checks it whatever the
+`sslmode`, where libpq checks nothing for `require` and `prefer` and no host
+name for `verify-ca`. The roots are the ones in `sslrootcert`, or in
+`~/.postgresql/root.crt` (`%APPDATA%\postgresql\root.crt` on Windows); for
+`require` and `prefer` without either, and for `sslrootcert=system` (which
+means `verify-full` unless an `sslmode` is given), the system's.
+`verify-ca` and `verify-full` without a root file are refused, as libpq
+refuses them. A server whose certificate is self-signed needs its
+certificate, or its root, in `sslrootcert`; with `prefer` it is otherwise
+reached unencrypted, after a handshake that fails.
+
+A server that asks for a client certificate is sent the one in `sslcert`
+and `sslkey` (`~/.postgresql/postgresql.crt` and `postgresql.key`): PEM, the
+key Ed25519, P-256 or RSA, unencrypted. TLS 1.3 is spoken, and 1.2 with a
+server that has nothing newer, unless `ssl_min_protocol_version=TLSv1.3`.
+
+Over TLS, SCRAM-SHA-256-PLUS binds the password exchange to the channel
+(`tls-server-end-point`) when the server offers it, so a man in the middle
+who ends TLS on both sides cannot relay it. `channel_binding=require`
+refuses a session without it - a server that asks for md5, a password, or
+none - and `channel_binding=disable` never binds.
+
+In iyi 0.18.0, a handshake run as a task in a debug build can overrun the
+task's 256 KiB stack - `std/ecdsa`'s check of one signature takes about
+230 KB of it in a debug build - and the program dies of a memory fault or
+reads a certificate as untrusted
+([iyi#130](https://github.com/iyilang/iyi/issues/130)). A `--release`
+build, or the handshake on the main fiber, is not affected.
 
 ### Listen/Notify
 
@@ -201,10 +245,10 @@ Values bound as arguments are iyi-db's `DBValue`s: the scalars, `Time`,
 
 ## Authentication methods
 
-By default this driver will accept `scram-sha-256` and `md5`, as well as
-`trust`. However `cleartext` is disabled by default. You can control exactly
-which auth methods the client will accept by passing in a comma separated list
-to the `auth_methods` parameter, for example
+By default this driver will accept `scram-sha-256-plus`, `scram-sha-256` and
+`md5`, as well as `trust`. However `cleartext` is disabled by default. You can
+control exactly which auth methods the client will accept by passing in a
+comma separated list to the `auth_methods` parameter, for example
 
 ```iyi
 Db::Db.open("postgres://example.com/dbname?auth_methods=cleartext,md5,scram-sha-256")
@@ -257,7 +301,8 @@ mistake that postgres continues to have this as an option at all.
 | `pg/errors` | `PGError`, `RuntimeError` |
 | `pg/pq/connection` | `PQConnection`, the protocol session |
 | `pg/pq/conninfo`, `pg/pq/pgpass` | `ConnInfo`, `PgPass` |
-| `pg/pq/frame`, `pg/pq/param`, `pg/pq/stream`, `pg/pq/scram` | messages, parameter encoding, the buffered socket, SCRAM |
+| `pg/pq/ssl` | the `TlsConfig` a `ConnInfo` asks for: roots, client certificate; the channel binding's certificate hash |
+| `pg/pq/frame`, `pg/pq/param`, `pg/pq/stream`, `pg/pq/scram` | messages, parameter encoding, the buffered socket or TLS session, SCRAM |
 | `pg/pq/errors` | `ConnectionError`, `StreamError`, `PQError`, `ErrorField` |
 
 ## What is different from crystal-pg
@@ -275,8 +320,7 @@ mistake that postgres continues to have this as an option at all.
 | `PG::Record(*T)`, which no decoder produced | `Record`, decoded for `record` and registered composite OIDs | so it can be read at all |
 | `CopyResult < IO` | `CopyResult` with `read`, `read_char`, `gets_to_end`, `write`, `<<`, `close` answering errors | `IyiIO` cannot answer one |
 | enums bound as their value | pass `.value` | an enum is not a `DBValue` |
-| TLS (`sslmode=require`, `verify-*`, client certificates, SCRAM-SHA-256-PLUS) | refused with `ConnectionError`; `prefer` and `allow` connect unencrypted | iyi has no TLS library yet |
-| host names resolved by DNS | IP literals and `localhost` | `std/socket` resolves no names yet |
+| `sslmode=require` and `prefer` encrypt without checking the certificate; `verify-ca` checks no host name | every certificate is checked, chain and host name: against `sslrootcert` or `root.crt`, else the system's roots | `std/tls` has no way to turn the checks off |
 
 ## Development
 
@@ -289,8 +333,14 @@ iyi-db's shared driver specs (`pg/driver_specs_test.iyi`). They read
 `DATABASE_URL`, `postgres:///` by default. The replication tests that need
 `wal_level=logical` are skipped, with a note, on a server without it, and
 the md5 and cleartext authentication tests, which need matching `pg_hba.conf`
-lines, run only with `RUN_AUTH_SPECS` set. `examples/` holds crystal-pg's
-examples, ported.
+lines, run only with `RUN_AUTH_SPECS` set. The TLS tests
+(`pg/pq/ssl_test.iyi`) run when `SSL_ROOT_CERT` names the root of the
+server's certificate for 127.0.0.1, and its client certificate test with
+`RUN_AUTH_SPECS`, `SSL_CLIENT_CERT` and `SSL_CLIENT_KEY` as well; the file
+says which `pg_hba.conf` lines they need. Run the rest against a server
+without TLS: their examples run as tasks, and connect with the default
+`sslmode=prefer` (see TLS above). `examples/` holds crystal-pg's examples,
+ported.
 
 ## Contributors
 
