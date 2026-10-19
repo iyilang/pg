@@ -18,8 +18,9 @@ Types, ranges and connection options crystal-pg does not have.
   one's own.
 * `connect_timeout` (and `PGCONNECT_TIMEOUT`) bounds each connection
   attempt: the TCP connect, the TLS handshake, and startup and
-  authentication. On Windows std/socket's connect ignores its timeout, so
-  the connect is cancelled at the deadline.
+  authentication. On Windows std/socket's connect ignores its timeout
+  ([iyi#131](https://github.com/iyilang/iyi/issues/131)), so the connect is
+  cancelled at the deadline.
 * `options` (and `PGOPTIONS`) is sent as the session's command-line options.
 * `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGCHANNELBINDING`
   and `PGSSLMINPROTOCOLVERSION` are read, a parameter given winning; a value

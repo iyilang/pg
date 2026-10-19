@@ -144,7 +144,7 @@ pub class PQConnection
   # *timeout_ms* when it is given. The bound is kept by cancelling the
   # connect as well as by handing it to std/socket, which on Windows
   # waits as long as the kernel does (`ConnectEx`: 21 s measured to an
-  # address that drops the handshake).
+  # address that drops the handshake; iyilang/iyi#131).
   protected def self.connect_socket(conninfo : ConnInfo, timeout_ms : Int32?) : IyiSocket | DBError
     fired = false
     socket = if conninfo.unix_socket?
