@@ -15,7 +15,7 @@ import std/uuid::{UUID}
 import std/json::{JSON, Any}
 import std/big::{BigDecimal, BigRational}
 import std/slice::{Slice, Bytes}
-import db/db/db
+import db
 import db/db/errors::*
 import db/db/value::{DBValue, ExecResult}
 import db/db/core::{Driver, ConnectionBuilder, ResultSet, Statement, Connection, ConnectionLost}
@@ -528,5 +528,5 @@ pub class PGDriver < Driver
   end
 end
 
-::Db::Db.register_driver "postgres", PGDriver
-::Db::Db.register_driver "postgresql", PGDriver
+::Db.register_driver "postgres", PGDriver
+::Db.register_driver "postgresql", PGDriver

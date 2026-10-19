@@ -13,7 +13,7 @@ module pg/pq/ssl_test
 
 import std/env
 import std/uri::{URI}
-import db/db/db
+import db
 import db/db/errors::*
 import db/db/spec::{describe}
 import pg/testing/spec_helper::*
@@ -44,7 +44,7 @@ end
 # Whether the session *url* opens is encrypted; panics when it is refused.
 def encrypted?(url : String) : Bool
   ssl = false
-  ::Db::Db.open(url) do |db|
+  ::Db.open(url) do |db|
     ssl = db.query_one("select ssl from pg_stat_ssl where pid = pg_backend_pid()", as: Bool).or_panic
   end.or_panic
   ssl
@@ -52,7 +52,7 @@ end
 
 # Why the session *url* opens is refused.
 def refusal(url : String) : String
-  result = ::Db::Db.open(url) { |_| nil }
+  result = ::Db.open(url) { |_| nil }
   raise "#{url} was not refused" unless result.is_a?(ConnectionRefused)
   cause = result.cause
   cause.nil? ? result.message : cause.message

@@ -5,7 +5,7 @@
 #
 # ```
 # group do |g|
-#   connection = Pg::Pg.connect_replication(db_url,
+#   connection = Pg.connect_replication(db_url,
 #     handler: MyHandler.new,
 #     publication_name: "my_publication",
 #     slot_name: "my_replication_slot",
@@ -20,7 +20,7 @@ import std/int
 import std/uri::{URI}
 import std/time::{Span}
 import std/log::{Log}
-import db/db/db
+import db
 import db/db/errors::{DBError}
 import pg/pq/errors::{StreamError}
 import pg/pq/stream::{Stream}
@@ -139,7 +139,7 @@ pub class Connection
 
   # :nodoc:
   def self.connect(url : String) : PGConnection | DBError
-    connection = ::Db::Db.connect(url)!
+    connection = ::Db.connect(url)!
     unless connection.is_a?(PGConnection)
       connection.close
       return DBError.new("#{url} is not a PostgreSQL connection")

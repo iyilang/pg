@@ -1,8 +1,14 @@
 ## v0.2.0
 
 On iyi 0.18.0, whose `std/tls` and resolver this release is built on; iyi
-0.17.0 is no longer enough.
+0.17.0 is no longer enough. On iyi-db 0.2.0.
 
+* The entry point is the package's root module, as iyi-db 0.2.0's is:
+  `import pg` and `Pg.connect`, `Pg.connect_listen`, `Pg.connect_replication`,
+  `Pg::ListenConnection` and `Pg::VERSION`, where they were `import pg/pg/pg`
+  and `Pg::Pg.connect`, ... The other modules are where they were. With
+  iyi-db 0.2.0, `Db.open` and `Db.connect` (`import db`) are what were
+  `Db::Db.open` and `Db::Db.connect`.
 * TLS, over `std/tls`: `sslmode` `prefer` (the default) and `allow` negotiate
   it as libpq does - `prefer` goes on unencrypted when the server declines or
   the handshake fails, `allow` tries TLS when the server refuses an

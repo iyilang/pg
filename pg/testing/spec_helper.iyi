@@ -5,7 +5,7 @@
 module pg/testing/spec_helper
 
 import std/env
-import db/db/db
+import db
 import db/db/core::{Database, Connection}
 import db/db/errors::{DBError}
 import pg/core::{PGConnection}
@@ -13,14 +13,14 @@ import pg/core::{PGConnection}
 pub DB_URL = ENV["DATABASE_URL"]? || "postgres:///"
 
 # A pool every test may use.
-pub PG_DB = ::Db::Db.open(DB_URL).or_panic
+pub PG_DB = ::Db.open(DB_URL).or_panic
 
 pub def with_db(& : Database -> Nil) : Nil
-  ::Db::Db.open(DB_URL) { |db| yield db }.or_panic
+  ::Db.open(DB_URL) { |db| yield db }.or_panic
 end
 
 pub def with_connection(& : PGConnection -> Nil) : Nil
-  ::Db::Db.connect(DB_URL) { |conn| yield conn.as(PGConnection) }.or_panic
+  ::Db.connect(DB_URL) { |conn| yield conn.as(PGConnection) }.or_panic
 end
 
 pub def escape_literal(string : String) : String

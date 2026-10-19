@@ -4,7 +4,7 @@ module pg/driver_test
 import std/int
 import std/text
 import std/json::{JSON, Any}
-import db/db/db
+import db
 import db/db/errors::*
 import db/db/value::{DBValue}
 import db/db/core::{ResultSet, Transaction}
@@ -32,9 +32,8 @@ def count_person(tx : Transaction) : DBValue
 end
 
 describe "PG::Driver" do
-  # by name: iyi's `Class` has no `==`
   it "should register postgres name" do
-    assert ::Db::Db.driver_class("postgres").or_panic.to_s == PGDriver.to_s
+    assert ::Db.driver_class("postgres").or_panic == PGDriver
   end
 
   it "exectes and selects value" do
@@ -216,7 +215,7 @@ describe "PG::Driver" do
 
   describe "close" do
     it "skips unread rows before releasing the connection" do
-      db = ::Db::Db.open("#{DB_URL}#{DB_URL.includes?("?") ? '&' : '?'}max_pool_size=1").or_panic
+      db = ::Db.open("#{DB_URL}#{DB_URL.includes?("?") ? '&' : '?'}max_pool_size=1").or_panic
       defer db.close
       row_read = Channel(Nil).new
       closed = false

@@ -14,7 +14,7 @@ are closed, and tasks are structured.
 
 ## Requirements
 
-iyi 0.18.0 or later, and iyi-db 0.1.1 (required by this package's `iyi.mod`).
+iyi 0.18.0 or later, and iyi-db 0.2.0 (required by this package's `iyi.mod`).
 Tested against PostgreSQL 16.
 
 ## Installation
@@ -25,21 +25,23 @@ Add it to a project under the short name `pg`:
 iyi get github.com/iyilang/pg --as pg
 ```
 
-Files then import its modules as `pg/pg/...`: the short name, then the
-module's path in the package. Importing `pg/pg/pg` (or `pg/pg/core`)
-registers the driver for `postgres://` and `postgresql://`.
+Files then `import pg` for the root module - `Pg.connect`,
+`Pg.connect_listen`, `Pg.connect_replication`, `Pg::VERSION` - and its other
+modules as `pg/pg/...`: the short name, then the module's path in the
+package. Importing `pg` (or `pg/pg/core`) registers the driver for
+`postgres://` and `postgresql://`.
 
 ## Usage
 
 ```iyi
 module app
 
-import db/db/db
+import db
 import db/db/errors::{DBError}
-import pg/pg/pg
+import pg
 
 def contacts : Nil | DBError
-  Db::Db.open("postgres://user:pass@127.0.0.1/mydb") do |db|
+  Db.open("postgres://user:pass@127.0.0.1/mydb") do |db|
     db.exec("create table contacts (name text, age integer)")!
     db.exec("insert into contacts values ($1, $2)", "John Doe", 30)!
 
@@ -79,7 +81,7 @@ unencrypted, and over TLS when the server refuses that; `require`,
 `verify-ca` and `verify-full` always. A Unix socket is never encrypted.
 
 ```iyi
-Db::Db.open("postgres://user:pass@db.example.com/mydb?sslmode=verify-full&sslrootcert=/etc/ssl/pg-root.crt")
+Db.open("postgres://user:pass@db.example.com/mydb?sslmode=verify-full&sslrootcert=/etc/ssl/pg-root.crt")
 ```
 
 `std/tls` checks every server's certificate - its chain to a root, and the
@@ -120,12 +122,12 @@ read <https://www.postgresql.org/docs/current/static/sql-notify.html>.
 1. Any connection can be given a callback to run on notifications. However they
    are only received when other traffic is going on.
 2. A special listen-only connection can be established for instant notification
-   processing with `Pg::Pg.connect_listen`. Its read loop runs as a task of
+   processing with `Pg.connect_listen`. Its read loop runs as a task of
    the group passed to it, and ends when the connection is closed.
 
 ```iyi
 group do |g|
-  conn = Pg::Pg.connect_listen("postgres:///", ["a", "b"], g) do |n|
+  conn = Pg.connect_listen("postgres:///", ["a", "b"], g) do |n|
     puts "    got: #{n.payload} on #{n.channel}"
   end.or_panic
   # ...
@@ -133,7 +135,7 @@ group do |g|
 end
 ```
 
-Without a group, `Pg::Pg.connect_listen(url, channels) { |n| ... }` reads in
+Without a group, `Pg.connect_listen(url, channels) { |n| ... }` reads in
 place until the connection is closed. `examples/listen_notify.iyi` is the
 whole program.
 
@@ -153,7 +155,7 @@ An array argument is sent in the array text format.
 ### Notices and errors
 
 ```iyi
-Db::Db.connect("postgres:///") do |cnn|
+Db.connect("postgres:///") do |cnn|
   pg = cnn.as(PGConnection) # import pg/pg/core::{PGConnection}
   pg.on_notice { |x| puts "pgSQL #{x}" }
   pg.exec("SELECT foo('yes')")!            # => pgSQL NOTICE:  Glad we agree!
@@ -198,7 +200,7 @@ class MyHandler < Handler
 end
 
 group do |g|
-  conn = Pg::Pg.connect_replication(url, handler: MyHandler.new,
+  conn = Pg.connect_replication(url, handler: MyHandler.new,
     publication_name: "my_publication", slot_name: "my_slot", group: g).or_panic
   # ...
   conn.close
@@ -251,7 +253,7 @@ control exactly which auth methods the client will accept by passing in a
 comma separated list to the `auth_methods` parameter, for example
 
 ```iyi
-Db::Db.open("postgres://example.com/dbname?auth_methods=cleartext,md5,scram-sha-256")
+Db.open("postgres://example.com/dbname?auth_methods=cleartext,md5,scram-sha-256")
 ```
 
 **DO NOT TURN `cleartext` ON UNLESS YOU ABSOLUTELY NEED IT!** Merely by having
@@ -290,7 +292,7 @@ mistake that postgres continues to have this as an option at all.
 
 | module | what it holds |
 |---|---|
-| `pg/pg` | `Pg::Pg.connect`, `connect_listen`, `connect_replication`, `ListenConnection`, `VERSION` |
+| `pg` (the root module) | `Pg.connect`, `connect_listen`, `connect_replication`, `ListenConnection`, `VERSION` |
 | `pg/core` | `PGDriver`, `PGConnection`, `PGStatement`, `PGResultSet`, `PGConnectionBuilder`; registers the driver |
 | `pg/decoder` | `Decoder` and one per type, `Decoders` (`from_oid`, `register_decoder`), `UUIDValue`, `JSONValue` |
 | `pg/numeric`, `pg/interval`, `pg/geo`, `pg/record` | the value classes |

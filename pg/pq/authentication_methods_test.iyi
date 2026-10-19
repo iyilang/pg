@@ -11,7 +11,7 @@ module pg/pq/authentication_methods_test
 import std/env
 import std/int
 import std/text
-import db/db/db
+import db
 import db/db/errors::*
 import db/db/spec::{describe, it, expect_error}
 import pg/pq/scram::{SaslContext, hmac_sha256, pbkdf2_sha256, md5_password, bytes_string}
@@ -26,7 +26,7 @@ def role_url(role : String, pass : String, query : String = "") : String
 end
 
 def test_role(role : String, pass : String) : Nil
-  ::Db::Db.open(role_url(role, pass)) do |db|
+  ::Db.open(role_url(role, pass)) do |db|
     assert db.query_one("select 1", as: Int32).or_panic == 1
   end.or_panic
 end
@@ -57,7 +57,7 @@ describe "PQ::Connection nologin role" do
   it "raises" do
     PG_DB.exec("drop role if exists crystal_test").or_panic
     PG_DB.exec("create role crystal_test nologin").or_panic
-    expect_error(::Db::Db.open("postgres://crystal_test@localhost"), ConnectionRefused)
+    expect_error(::Db.open("postgres://crystal_test@localhost"), ConnectionRefused)
     PG_DB.exec("drop role if exists crystal_test").or_panic
     nil
   end
@@ -73,17 +73,17 @@ describe "PQ::Connection scram auth" do
 
   it "fails with a bad password" do
     create_role("crystal_scram", "scram-sha-256")
-    expect_error(::Db::Db.open(role_url("crystal_scram", "wrong")), ConnectionRefused)
-    expect_error(::Db::Db.open(role_url("crystal_scram", "")), ConnectionRefused)
+    expect_error(::Db.open(role_url("crystal_scram", "wrong")), ConnectionRefused)
+    expect_error(::Db.open(role_url("crystal_scram", "")), ConnectionRefused)
     PG_DB.exec("drop role if exists crystal_scram").or_panic
     nil
   end
 
   it "fails if auth_method is disabled" do
     create_role("crystal_scram", "scram-sha-256")
-    cause = refusal_cause(::Db::Db.open("postgres://crystal_scram:pass@127.0.0.1:#{PORT}/?auth_methods=cleartext,md5"))
+    cause = refusal_cause(::Db.open("postgres://crystal_scram:pass@127.0.0.1:#{PORT}/?auth_methods=cleartext,md5"))
     assert cause.includes?("server asked for disabled authentication method: scram-sha-256"), cause
-    cause = refusal_cause(::Db::Db.open(role_url("crystal_scram", "pass", "?auth_methods=md5")))
+    cause = refusal_cause(::Db.open(role_url("crystal_scram", "pass", "?auth_methods=md5")))
     assert cause.includes?("server asked for disabled authentication method: scram-sha-256"), cause
     PG_DB.exec("drop role if exists crystal_scram").or_panic
     nil
@@ -101,15 +101,15 @@ if ENV["RUN_AUTH_SPECS"]?
 
     it "fails when given the wrong password" do
       create_role("crystal_md5", "md5")
-      expect_error(::Db::Db.open(role_url("crystal_md5", "bad")), ConnectionRefused)
-      expect_error(::Db::Db.open(role_url("crystal_md5", "")), ConnectionRefused)
+      expect_error(::Db.open(role_url("crystal_md5", "bad")), ConnectionRefused)
+      expect_error(::Db.open(role_url("crystal_md5", "")), ConnectionRefused)
       PG_DB.exec("drop role if exists crystal_md5").or_panic
       nil
     end
 
     it "fails if auth_method is disabled" do
       create_role("crystal_md5", "md5")
-      cause = refusal_cause(::Db::Db.open("postgres://crystal_md5:pass@127.0.0.1:#{PORT}?auth_methods=cleartext,scram-sha-256"))
+      cause = refusal_cause(::Db.open("postgres://crystal_md5:pass@127.0.0.1:#{PORT}?auth_methods=cleartext,scram-sha-256"))
       assert cause.includes?("server asked for disabled authentication method: md5"), cause
       PG_DB.exec("drop role if exists crystal_md5").or_panic
       nil
@@ -121,9 +121,9 @@ if ENV["RUN_AUTH_SPECS"]?
   describe "PQ::Connection cleartext auth" do
     it "fails by default" do
       create_role("crystal_clear", "scram-sha-256")
-      cause = refusal_cause(::Db::Db.open("postgres://crystal_clear:pass@127.0.0.1:#{PORT}"))
+      cause = refusal_cause(::Db.open("postgres://crystal_clear:pass@127.0.0.1:#{PORT}"))
       assert cause.includes?("server asked for disabled authentication method: cleartext"), cause
-      cause = refusal_cause(::Db::Db.open("postgres://crystal_clear:pass@127.0.0.1:#{PORT}/?auth_methods=md5,scram-sha-256"))
+      cause = refusal_cause(::Db.open("postgres://crystal_clear:pass@127.0.0.1:#{PORT}/?auth_methods=md5,scram-sha-256"))
       assert cause.includes?("server asked for disabled authentication method: cleartext"), cause
       PG_DB.exec("drop role if exists crystal_clear").or_panic
       nil
@@ -131,8 +131,8 @@ if ENV["RUN_AUTH_SPECS"]?
 
     it "works when auth_method is enabled" do
       create_role("crystal_clear", "scram-sha-256")
-      ::Db::Db.open(role_url("crystal_clear", "pass", "?auth_methods=cleartext")) { |_| nil }.or_panic
-      ::Db::Db.open(role_url("crystal_clear", "pass", "?auth_methods=cleartext,md5,scram-sha-256")) { |_| nil }.or_panic
+      ::Db.open(role_url("crystal_clear", "pass", "?auth_methods=cleartext")) { |_| nil }.or_panic
+      ::Db.open(role_url("crystal_clear", "pass", "?auth_methods=cleartext,md5,scram-sha-256")) { |_| nil }.or_panic
       PG_DB.exec("drop role if exists crystal_clear").or_panic
       nil
     end

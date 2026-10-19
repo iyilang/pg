@@ -17,14 +17,14 @@ import std/slice::{Slice, Bytes}
 import std/uuid::{UUID}
 import std/uri::{URI}
 import std/socket::{IyiSocket}
-import db/db/db
+import db
 import db/db/errors::{DBError}
 import db/db/spec::{describe, it, expect_error, panics?}
 import pg/pq/errors::{StreamError}
 import pg/pq/stream::{ByteSource, MemorySource, Stream}
 import pg/errors::{PGError}
 import pg/core::{PGConnection}
-import pg/pg
+import pg
 import pg/replication::{Handler, Connection}
 import pg/replication/messages::*
 import pg/testing/spec_helper::*
@@ -755,7 +755,7 @@ describe "PG::Replication::Connection" do
       # The slot does not exist: the server answers START_REPLICATION with
       # an error and waits for the next command, which keepalives do not
       # disturb.
-      subscriber = ::Pg::Pg.connect_replication(replication_url("application_name=#{app}"),
+      subscriber = ::Pg.connect_replication(replication_url("application_name=#{app}"),
         handler: handler,
         publication_name: "test_publication_#{random_hex}",
         slot_name: "test_slot_#{random_hex}",
@@ -831,7 +831,7 @@ def it_consumes_wal(name : String, &block : TestMessageHandler, Context -> Nil) 
     PG_DB.exec("SELECT pg_create_logical_replication_slot($1, 'pgoutput')", context.slot_name).or_panic
     defer cleanup_wal_examples
     group do |g|
-      subscriber = ::Pg::Pg.connect_replication(DB_URL,
+      subscriber = ::Pg.connect_replication(DB_URL,
         handler: handler,
         publication_name: context.publication_name,
         slot_name: context.slot_name,

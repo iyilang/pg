@@ -5,19 +5,18 @@
 # `postgresql://` URIs:
 #
 # ```
-# import db/db/db
-# import pg/pg/pg
+# import pg
 #
-# Db::Db.open("postgres://user:pass@localhost/mydb") do |db|
+# Db.open("postgres://user:pass@localhost/mydb") do |db|
 #   puts db.scalar("select 1")!
 # end
 # ```
-module pg/pg
+module pg
 
 pub import pg/core
 
 import std/uri::{URI}
-import db/db/db
+import db
 import db/db/errors::{DBError}
 import db/db/core::{Database}
 import pg/pq/frame::{Notification}
@@ -29,7 +28,7 @@ pub VERSION = "0.2.0"
 
 # Establish a connection pool to the database.
 pub def connect(url : String) : Database | DBError
-  ::Db::Db.open(url)
+  ::Db.open(url)
 end
 
 # Establish a special listen-only connection to the database, and read its
@@ -38,7 +37,7 @@ end
 #
 # ```
 # group do |g|
-#   conn = Pg::Pg.connect_listen(ENV["DATABASE_URL"], ["foo", "bar"], g) do |notification|
+#   conn = Pg.connect_listen(ENV["DATABASE_URL"], ["foo", "bar"], g) do |notification|
 #     pp notification.channel, notification.payload, notification.pid
 #   end!
 #   # ...
@@ -73,7 +72,7 @@ end
 #
 # ```
 # group do |g|
-#   conn = Pg::Pg.connect_replication(ENV["DATABASE_URL"],
+#   conn = Pg.connect_replication(ENV["DATABASE_URL"],
 #     handler: MyHandler.new,
 #     publication_name: "my_publication",
 #     slot_name: "my_replication_slot",
@@ -109,7 +108,7 @@ pub class ListenConnection
   # Connects to *url* and listens on *channels*, handing notifications to
   # *blk* once `#listen` reads them.
   def self.open(url : String, channels : Array(String), &blk : Notification -> Nil) : ListenConnection | DBError
-    connection = ::Db::Db.connect(url)!
+    connection = ::Db.connect(url)!
     unless connection.is_a?(PGConnection)
       connection.close
       return DBError.new("#{url} is not a PostgreSQL connection")

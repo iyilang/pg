@@ -107,4 +107,4 @@ jobs:
           done
 
       - name: Check formatting
-        run: iyi fmt --check pg examples
+        run: iyi fmt --check pg.iyi pg examples

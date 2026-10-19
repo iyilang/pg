@@ -3,17 +3,17 @@ module pg/connection_test
 
 import std/time::{Time}
 import std/uri::{URI}
-import db/db/db
+import db
 import db/db/errors::*
 import db/db/spec::{describe, it, expect_error}
 import pg/pq/frame::{Notice, Notification}
 import pg/core::{PGConnection}
-import pg/pg
+import pg
 import pg/testing/spec_helper::*
 
 describe "PG::Connection#initialize" do
   it "answers ConnectionRefused on bad connections" do
-    expect_error(::Db::Db.open("postgres://localhost:5433"), ConnectionRefused)
+    expect_error(::Db.open("postgres://localhost:5433"), ConnectionRefused)
     nil
   end
 
@@ -107,7 +107,7 @@ describe "PG#listen" do
     got = false
     ch = Channel(Nil).new
     group do |g|
-      conn = ::Pg::Pg.connect_listen(DB_URL, ["foo", "bar"], g) do |_|
+      conn = ::Pg.connect_listen(DB_URL, ["foo", "bar"], g) do |_|
         got = true
         ch.send(nil)
         nil
@@ -221,5 +221,5 @@ describe "PG COPY" do
 end
 
 def with_db_at(url : String, & : ::Db::Core::Database -> Nil) : Nil
-  ::Db::Db.open(url) { |db| yield db }.or_panic
+  ::Db.open(url) { |db| yield db }.or_panic
 end

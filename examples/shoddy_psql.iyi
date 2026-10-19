@@ -6,7 +6,7 @@
 module examples/shoddy_psql
 
 import std/text
-import db/db/db
+import db
 import db/db/core::{ResultSet}
 import db/db/errors::{DBError}
 import db/db/value::{DBValue}
@@ -78,7 +78,7 @@ def show(rows : Array(Array(DBValue))) : Nil
 end
 
 url = Program.args[0]? || "postgres:///"
-db = ::Db::Db.open(url).or_panic
+db = ::Db.open(url).or_panic
 
 loop do
   query = readline
