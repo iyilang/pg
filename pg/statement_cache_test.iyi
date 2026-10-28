@@ -1,0 +1,317 @@
+# The session's prepared statements (iyilang/pg#1): a query is parsed once
+# per connection, then bound and executed by name. The Parse messages a
+# session sends are counted by `PQConnection#parse_count`; what the server
+# holds is read from `pg_prepared_statements` with unprepared queries, which
+# use the unnamed statement and leave the cache alone.
+module pg/statement_cache_test
+
+import std/uri::{URI}
+import std/time::{Time}
+import db
+import db/db/errors::*
+import db/db/core::{Database, Connection}
+import db/db/spec::{describe, it, expect_error}
+import pg/pq/errors::{PQError}
+import pg/pq/conninfo::{ConnInfo}
+import pg/pq/statement_cache::{StatementCache}
+import pg/core::{PGConnection}
+import pg/testing/spec_helper::*
+
+# DB_URL with *params* added to its query.
+def url_with(params : String) : String
+  uri = URI.parse(DB_URL)
+  query = uri.query
+  uri.query = query.nil? || query.empty? ? params : "#{query}&#{params}"
+  uri.to_s
+end
+
+def with_connection_at(url : String, & : PGConnection -> Nil) : Nil
+  ::Db.connect(url) { |conn| yield conn.as(PGConnection) }.or_panic
+end
+
+def parses(conn : PGConnection) : Int64
+  conn.connection.parse_count
+end
+
+# The statements the server holds prepared for the session, by text.
+def server_statements(conn : PGConnection) : Array(String)
+  texts = [] of String
+  conn.unprepared.query("select statement from pg_prepared_statements order by statement") do |rs|
+    rs.each { texts << rs.read(String).or_panic; nil }.or_panic
+    nil
+  end.or_panic
+  texts
+end
+
+def code_of(result : V) : String forall V
+  if result.is_a?(PQError)
+    result.field_message(:code) || ""
+  else
+    "not a PQError: #{result.inspect}"
+  end
+end
+
+Q1 = "select $1::int4 + 1"
+Q2 = "select $1::int4 + 2"
+Q3 = "select $1::int4 + 3"
+
+describe "PG statement cache" do
+  it "parses a query once per connection, then binds it by name" do
+    with_connection do |conn|
+      before = parses(conn)
+      assert conn.scalar(Q1, 1).or_panic == 2
+      assert parses(conn) == before + 1
+      3.times { |i| assert conn.scalar(Q1, i).or_panic == i + 1 }
+      assert parses(conn) == before + 1, "#{parses(conn) - before} parses"
+      assert conn.connection.statement_cache.includes?(Q1)
+      assert server_statements(conn).includes?(Q1)
+    end
+  end
+
+  it "keeps the description of rows and of no rows" do
+    with_connection do |conn|
+      conn.exec("create temporary table cache_rows (a int4, b text)").or_panic
+      2.times do |i|
+        conn.exec("insert into cache_rows values ($1, $2)", i, "row #{i}").or_panic
+      end
+      2.times do
+        conn.query("select a, b from cache_rows order by a") do |rs|
+          assert rs.column_count == 2
+          assert rs.column_name(1) == "b"
+          got = [] of String
+          rs.each { got << "#{rs.read(Int32).or_panic} #{rs.read(String).or_panic}"; nil }.or_panic
+          assert got == ["0 row 0", "1 row 1"], got.inspect
+          nil
+        end.or_panic
+      end
+      result = conn.exec("update cache_rows set b = $1 where a = $2", "x", 1).or_panic
+      assert result.rows_affected == 1
+      result = conn.exec("update cache_rows set b = $1 where a = $2", "y", 7).or_panic
+      assert result.rows_affected == 0
+    end
+  end
+
+  it "evicts the least recently used statement, closing it on the server" do
+    with_connection_at(url_with("statement_cache_capacity=2")) do |conn|
+      cache = conn.connection.statement_cache
+      assert cache.capacity == 2
+      conn.scalar(Q1, 1).or_panic
+      conn.scalar(Q2, 1).or_panic
+      conn.scalar(Q1, 1).or_panic # Q1 is now the more recently used
+      before = parses(conn)
+      conn.scalar(Q3, 1).or_panic # makes room by giving up Q2
+      assert parses(conn) == before + 1
+      assert cache.size == 2
+      assert cache.includes?(Q1) && cache.includes?(Q3) && !cache.includes?(Q2)
+      assert server_statements(conn) == [Q1, Q3], server_statements(conn).inspect
+      # Q1 was kept: no Parse; Q2 was not: parsed again
+      before = parses(conn)
+      assert conn.scalar(Q1, 5).or_panic == 6
+      assert parses(conn) == before
+      assert conn.scalar(Q2, 5).or_panic == 7
+      assert parses(conn) == before + 1
+      assert server_statements(conn).size == 2
+    end
+  end
+
+  it "prepares a statement again when ALTER TABLE elsewhere changed its rows' type" do
+    PG_DB.exec("drop table if exists cache_alter").or_panic
+    PG_DB.exec("create table cache_alter (a int4)").or_panic
+    PG_DB.exec("insert into cache_alter values (1)").or_panic
+    with_connection do |conn|
+      assert conn.query_one("select * from cache_alter", as: Int32).or_panic == 1
+      with_connection { |other| other.exec("alter table cache_alter alter column a type text").or_panic }
+      # the kept statement fails to bind with 0A000, "cached plan must not
+      # change result type"; it is given up and the query prepared anew
+      before = parses(conn)
+      assert conn.query_one("select * from cache_alter", as: String).or_panic == "1"
+      assert parses(conn) == before + 1
+      with_connection { |other| other.exec("alter table cache_alter add column b int4").or_panic }
+      assert conn.query("select * from cache_alter") { |rs| rs.column_count }.or_panic == 2
+      assert server_statements(conn).count { |text| text == "select * from cache_alter" } == 1
+    end
+    PG_DB.exec("drop table cache_alter").or_panic
+  end
+
+  it "prepares a statement again when a column's type changed elsewhere under its parameter" do
+    PG_DB.exec("drop table if exists cache_param").or_panic
+    PG_DB.exec("create table cache_param (a int4)").or_panic
+    with_connection do |conn|
+      conn.exec("insert into cache_param values ($1)", 7).or_panic
+      with_connection { |other| other.exec("alter table cache_param alter column a type text").or_panic }
+      # $1 was inferred as int4; "seven" does not convert to it (22P02)
+      conn.exec("insert into cache_param values ($1)", "seven").or_panic
+      assert conn.query_one("select count(*) from cache_param where a = $1", "seven", as: Int64).or_panic == 1_i64
+    end
+    PG_DB.exec("drop table cache_param").or_panic
+  end
+
+  it "prepares its statements anew after DDL on the same connection" do
+    with_connection do |conn|
+      conn.exec("set time zone 'Europe/Istanbul'").or_panic
+      at = Time.utc(2019, 8, 13, 16, 30)
+      conn.exec("create temporary table cache_ddl (v timestamp)").or_panic
+      conn.exec("insert into cache_ddl values ($1)", at).or_panic
+      conn.exec("drop table cache_ddl").or_panic
+      assert conn.connection.statement_cache.size == 0
+      conn.exec("create temporary table cache_ddl (v timestamptz)").or_panic
+      # kept, $1 would still be a timestamp, and 16:30 read in Istanbul
+      conn.exec("insert into cache_ddl values ($1)", at).or_panic
+      got = conn.query_one("select v from cache_ddl", as: Time).or_panic
+      assert got == at, got.inspect
+    end
+  end
+
+  it "answers the error inside a transaction, and prepares anew after it" do
+    PG_DB.exec("drop table if exists cache_tx").or_panic
+    PG_DB.exec("create table cache_tx (a int4)").or_panic
+    PG_DB.exec("insert into cache_tx values (1)").or_panic
+    with_connection do |conn|
+      assert conn.query_one("select * from cache_tx", as: Int32).or_panic == 1
+      with_connection { |other| other.exec("alter table cache_tx alter column a type int8").or_panic }
+      tx = conn.begin_transaction.or_panic
+      # no retry: the transaction is aborted
+      assert code_of(conn.query_one("select * from cache_tx", as: Int64)) == "0A000"
+      tx.rollback.or_panic
+      assert conn.query_one("select * from cache_tx", as: Int64).or_panic == 1_i64
+    end
+    PG_DB.exec("drop table cache_tx").or_panic
+  end
+
+  it "keeps its statements through an error in a transaction" do
+    with_connection do |conn|
+      assert conn.scalar(Q1, 1).or_panic == 2
+      tx = conn.begin_transaction.or_panic
+      before = parses(conn)
+      assert conn.scalar(Q1, 2).or_panic == 3
+      assert code_of(conn.exec("select 1/0")) == "22012"
+      # bound in the aborted transaction: refused, and not taken as stale
+      assert code_of(conn.scalar(Q1, 3)) == "25P02"
+      # only `select 1/0` was parsed
+      assert parses(conn) == before + 1, "#{parses(conn) - before} parses"
+      tx.rollback.or_panic
+      before = parses(conn)
+      assert conn.scalar(Q1, 4).or_panic == 5
+      assert parses(conn) == before
+      assert conn.connection.statement_cache.includes?(Q1)
+    end
+  end
+
+  it "prepares again after DEALLOCATE ALL, DISCARD ALL or a DEALLOCATE of one" do
+    with_connection do |conn|
+      conn.scalar(Q1, 1).or_panic
+      conn.scalar(Q2, 1).or_panic
+      cache = conn.connection.statement_cache
+      conn.exec("deallocate all").or_panic
+      assert cache.size == 0
+      assert server_statements(conn).empty?
+      assert conn.scalar(Q1, 1).or_panic == 2
+
+      conn.unprepared.exec("discard all").or_panic
+      assert cache.size == 0
+      assert conn.scalar(Q1, 1).or_panic == 2
+
+      # a statement dropped behind the cache's back: 26000 when bound, and
+      # the query prepared anew
+      name = server_name(conn, Q1)
+      conn.unprepared.exec("deallocate #{name}").or_panic
+      before = parses(conn)
+      assert conn.scalar(Q1, 2).or_panic == 3
+      assert parses(conn) == before + 1
+      assert server_statements(conn) == [Q1], server_statements(conn).inspect
+    end
+  end
+
+  it "is the connection's, through checkouts by other tasks" do
+    with_db_at(url_with("max_pool_size=1&initial_pool_size=1")) do |db|
+      pid = 0
+      before = 0_i64
+      db.using_connection do |conn|
+        pg = conn.as(PGConnection)
+        pid = pg.backend_pid
+        assert pg.scalar(Q1, 1).or_panic == 2
+        before = parses(pg)
+        nil
+      end.or_panic
+      group do |g|
+        3.times do |i|
+          g.spawn do
+            assert db.scalar(Q1, i).or_panic == i + 1
+            nil
+          end
+        end
+      end
+      db.using_connection do |conn|
+        pg = conn.as(PGConnection)
+        assert pg.backend_pid == pid
+        assert parses(pg) == before, "#{parses(pg) - before} parses"
+        nil
+      end.or_panic
+    end
+  end
+
+  it "is off with statement_cache_capacity=0, prepared_statements_cache=false, or unprepared" do
+    ["statement_cache_capacity=0", "prepared_statements_cache=false", "prepared_statements=false"].each do |off|
+      with_connection_at(url_with(off)) do |conn|
+        before = parses(conn)
+        3.times { |i| assert conn.scalar(Q1, i).or_panic == i + 1 }
+        assert parses(conn) == before + 3, "#{off}: #{parses(conn) - before} parses"
+        assert conn.connection.statement_cache.size == 0
+        assert server_statements(conn).empty?, off
+      end
+    end
+    with_connection do |conn|
+      before = parses(conn)
+      2.times { assert conn.unprepared.scalar("select 1").or_panic == 1 }
+      assert parses(conn) == before + 2
+      assert conn.connection.statement_cache.size == 0
+    end
+  end
+
+  it "reads statement_cache_capacity from the URL, and refuses a bad one" do
+    assert ConnInfo.from_conninfo_string("postgres://u@h/d").or_panic.statement_cache_capacity == ConnInfo::STATEMENT_CACHE_CAPACITY
+    assert ConnInfo.from_conninfo_string("postgres://u@h/d?statement_cache_capacity=7").or_panic.statement_cache_capacity == 7
+    assert ConnInfo.from_conninfo_string("host=h statement_cache_capacity=0").or_panic.statement_cache_capacity == 0
+    expect_error(ConnInfo.from_conninfo_string("postgres://u@h/d?statement_cache_capacity=-1"), ArgumentError)
+    expect_error(ConnInfo.from_conninfo_string("postgres://u@h/d?statement_cache_capacity=many"), ArgumentError)
+    nil
+  end
+end
+
+describe "PG StatementCache" do
+  it "names statements once each, and closes what it gives up" do
+    cache = StatementCache.new(2)
+    a = cache.next_name
+    cache.store("a", a, nil)
+    b = cache.next_name
+    cache.store("b", b, nil)
+    assert a != b
+    assert !cache.closing?
+    cache.fetch?("a")
+    c = cache.next_name # full: b, the least recently used, goes
+    assert c != a && c != b
+    cache.store("c", c, nil)
+    assert cache.take_closing == [b]
+    assert cache.take_closing.empty?
+    cache.evict("a")
+    cache.evict("missing")
+    assert cache.take_closing == [a]
+    cache.evict_all
+    assert cache.take_closing == [c]
+    assert cache.size == 0
+    cache.store("d", cache.next_name, nil)
+    cache.close_later("orphan")
+    cache.forget_all
+    assert cache.size == 0 && !cache.closing?
+    assert !StatementCache.new(0).enabled?
+  end
+end
+
+# The name the server holds *query* prepared under.
+def server_name(conn : PGConnection, query : String) : String
+  conn.unprepared.query_one("select name from pg_prepared_statements where statement = $1", query, as: String).or_panic
+end
+
+def with_db_at(url : String, & : Database -> Nil) : Nil
+  ::Db.open(url) { |db| yield db }.or_panic
+end

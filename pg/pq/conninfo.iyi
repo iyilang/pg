@@ -44,6 +44,10 @@ pub struct ConnInfo
   # The `ssl_min_protocol_version`s std/tls speaks.
   TLS_VERSIONS = ["TLSv1.2", "TLSv1.3"]
 
+  # The prepared statements a session keeps unless `statement_cache_capacity`
+  # says otherwise: pgx's default.
+  STATEMENT_CACHE_CAPACITY = 512
+
   # The host. If it starts with a / it is the directory of a local Unix
   # socket.
   getter host : String
@@ -101,6 +105,12 @@ pub struct ConnInfo
   # statement_timeout=5000`. Optional.
   getter options : String?
 
+  # How many prepared statements a session keeps, by query text, so a query
+  # run again is not parsed again (`pg/pq/statement_cache`):
+  # `STATEMENT_CACHE_CAPACITY` unless given. 0 keeps none, and every
+  # statement is parsed each time it runs, as the unnamed statement.
+  getter statement_cache_capacity : Int32
+
   # A connection description from its parts; what is not given is taken from
   # the environment (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
   # `PGPASSWORD`, `PGAPPNAME`) or the password file. The database defaults
@@ -125,6 +135,7 @@ pub struct ConnInfo
     @ssl_min_protocol_version = "TLSv1.2"
     @connect_timeout = connect_timeout ? ConnInfo.effective_timeout(connect_timeout) : nil
     @options = options.presence if options
+    @statement_cache_capacity = STATEMENT_CACHE_CAPACITY
   end
 
   # `connect_timeout` in milliseconds, nil for no bound.
@@ -211,9 +222,9 @@ pub struct ConnInfo
   # From a `URI`: its host (or the `host` parameter), port, path as the
   # database, user and password, and `application_name`, `replication`,
   # `sslmode`, `sslcert`, `sslkey`, `sslrootcert`, `channel_binding`,
-  # `ssl_min_protocol_version`, `connect_timeout`, `options` and
-  # `auth_methods` from its query; the `ENV_DEFAULTS` for those it does not
-  # give.
+  # `ssl_min_protocol_version`, `connect_timeout`, `options`,
+  # `statement_cache_capacity` and `auth_methods` from its query; the
+  # `ENV_DEFAULTS` for those it does not give.
   def self.from_uri(uri : URI) : ConnInfo | DBError
     params = Params.parse(uri.query || "")
     hostname = (uri.hostname || "").presence || params["host"]? || ""
@@ -233,8 +244,8 @@ pub struct ConnInfo
   # `"password"`, `"port"`, `"sslmode"`, `"sslcert"`, `"sslkey"`,
   # `"sslrootcert"`, `"channel_binding"`, `"ssl_min_protocol_version"`,
   # `"connect_timeout"`, `"options"`, `"application_name"`,
-  # `"replication"` and `"auth_methods"`; the `ENV_DEFAULTS` for those it
-  # does not give.
+  # `"replication"`, `"statement_cache_capacity"` and `"auth_methods"`; the
+  # `ENV_DEFAULTS` for those it does not give.
   def self.from_hash(params : Hash(String, String)) : ConnInfo | DBError
     port = parse_port(params["port"]?)! || env_port!
     info = ConnInfo.new(params["host"]?, params["dbname"]?, params["user"]?,
@@ -327,6 +338,12 @@ pub struct ConnInfo
       @connect_timeout = ConnInfo.effective_timeout(seconds)
     when "options"
       @options = value.presence
+    when "statement_cache_capacity"
+      capacity = value.strip.to_i?
+      if capacity.nil? || capacity < 0
+        return ArgumentError.new("invalid statement_cache_capacity #{value.inspect}: a number of statements, 0 for none")
+      end
+      @statement_cache_capacity = capacity
     when "auth_methods"
       methods = [] of String
       value.split(',').each do |method|
