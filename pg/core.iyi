@@ -300,7 +300,7 @@ pub class PGResultSet < ResultSet
   end
 
   private def decoder(index : Int32) : Decoder
-    Decoders.from_oid(oid(index))
+    @conn.decoders.from_oid(oid(index))
   end
 
   private def oid(index : Int32) : Int32

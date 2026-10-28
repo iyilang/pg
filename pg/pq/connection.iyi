@@ -21,6 +21,7 @@ import pg/pq/conninfo::{ConnInfo}
 import pg/pq/frame::*
 import pg/pq/param::{Param}
 import pg/pq/statement_cache::{StatementCache}
+import pg/decoder::{Decoders, DecoderTable}
 import pg/pq/scram::{SaslContext, md5_password}
 import pg/pq/ssl::{tls_config, server_end_point}
 import pg/pq/pgpass::{LOG}
@@ -50,6 +51,8 @@ pub class PQConnection
   # The transaction status of the last ReadyForQuery: `'I'` idle, `'T'` in
   # a transaction block, `'E'` in a failed one.
   getter transaction_status : Char = 'I'
+  # The decoders this session reads columns with; see `decoders`.
+  @decoders : DecoderTable? = nil
 
   def initialize(@stream : Stream, @conninfo : ConnInfo)
     @server_parameters = {} of String => String
@@ -69,6 +72,17 @@ pub class PQConnection
   # How much sooner than its deadline a wait may end and still be taken
   # for the timeout's: a socket's timer fires on the platform's tick.
   TIMEOUT_SLACK_MS = 50
+
+  # The decoders this session reads columns with: the registry's table,
+  # taken again only when a decoder was registered after it, so reading a
+  # column takes no lock.
+  def decoders : DecoderTable
+    table = @decoders
+    return table if table && table.current?(Decoders.generation)
+    table = Decoders.table
+    @decoders = table
+    table
+  end
 
   # The process id of the session's backend on the server, 0 when the
   # server named none.

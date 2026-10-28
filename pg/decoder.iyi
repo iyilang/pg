@@ -22,6 +22,8 @@ import pg/geo::{Point, Line, Circle, LineSegment, Box, Path, Polygon}
 import pg/time_tz::{TimeTz}
 import pg/inet::{Inet}
 import std/netip::{IP, Prefix}
+import std/list::{List}
+import std/mutex::{Mutex}
 
 # A `uuid` column. `DBValue` is a closed set and `std/uuid`'s `UUID` is not
 # in it, so the value a plain `read` answers wraps one; `read(UUID)` answers
@@ -700,10 +702,15 @@ end
 # with `nil` for NULL. An array whose lower bound is above 1 is padded with
 # `nil`s in front, as crystal-pg reads it.
 pub class ArrayDecoder < Decoder
-  getter oids : Array(Int32)
+  @oids : List(Int32)
   getter element : Decoder
 
-  def initialize(@oids : Array(Int32), @element : Decoder)
+  def initialize(oids : Array(Int32), @element : Decoder)
+    @oids = List(Int32).new(oids)
+  end
+
+  def oids : Array(Int32)
+    @oids.to_a
   end
 
   def type_name : String
@@ -768,21 +775,121 @@ pub class ArrayDecoder < Decoder
   end
 end
 
-DECODERS        = {} of Int32 => Decoder
 DEFAULT_DECODER = ByteaDecoder.new
 
-# The decoder registry, and array reading by element type.
-pub struct Decoders
-  # The decoder for *oid*; `Bytes` for an OID nobody registered.
-  def self.from_oid(oid : Int32) : Decoder
-    DECODERS[oid]? || DEFAULT_DECODER
+# The decoders by OID as some registration left them: the OIDs sorted, in a
+# `List`, and their decoders in another, never changed after they are
+# built, so any thread may read one (SPEC.md III.4.4). *generation* is the
+# count of registrations it holds.
+pub class DecoderTable
+  getter generation : Int64
+  @oids : List(Int32)
+  @decoders : List(Decoder)
+
+  def initialize(by_oid : Hash(Int32, Decoder), @generation : Int64)
+    oids = by_oid.keys
+    oids.sort_in_place
+    @oids = List(Int32).new(oids)
+    @decoders = List(Decoder).new(oids.map { |oid| by_oid[oid] })
   end
 
-  # Registers *decoder* for each of its OIDs.
-  def self.register_decoder(decoder : Decoder) : Nil
-    decoder.oids.each do |oid|
-      DECODERS[oid] = decoder
+  # The decoder for *oid*; `Bytes` for an OID nobody registered.
+  def from_oid(oid : Int32) : Decoder
+    find(oid) || DEFAULT_DECODER
+  end
+
+  # The decoder registered for *oid*, by binary search; nil when none is.
+  def find(oid : Int32) : Decoder?
+    low = 0
+    high = @oids.size - 1
+    while low <= high
+      middle = (low + high) // 2
+      found = @oids[middle]
+      return @decoders[middle] if found == oid
+      if found < oid
+        low = middle + 1
+      else
+        high = middle - 1
+      end
     end
+    nil
+  end
+
+  # Whether every registration *generation* counts is in this table.
+  def current?(generation : Int64) : Bool
+    @generation >= generation
+  end
+end
+
+# What `Decoders` keeps behind its lock: every registration, and the table
+# of them, built when it is first asked for after one.
+class DecoderRegistry
+  @by_oid : Hash(Int32, Decoder)
+  @count : Int64
+  @table : DecoderTable?
+
+  def initialize
+    @by_oid = {} of Int32 => Decoder
+    @count = 0_i64
+    @table = nil
+  end
+
+  def register(oids : List(Int32), decoder : Decoder) : Nil
+    oids.each { |oid| @by_oid[oid] = decoder }
+    @count += 1
+    @table = nil
+  end
+
+  def table : DecoderTable
+    if table = @table
+      return table
+    end
+    table = DecoderTable.new(@by_oid, @count)
+    @table = table
+    table
+  end
+end
+
+# The decoder registry, and array reading by element type.
+#
+# Registrations go into a `DecoderRegistry` behind a lock, from any thread
+# at any time. A connection reads its columns through a `DecoderTable` it
+# holds (`PQConnection#decoders`), taken from the registry again only after
+# a registration, so a column is read without a lock; `from_oid` takes the
+# lock.
+pub struct Decoders
+  @@registry : Mutex(DecoderRegistry) = Mutex.new { DecoderRegistry.new }
+  # Counts registrations, after each is in the registry: a table that
+  # holds fewer is out of date.
+  @@generation : Atomic(Int64) = Atomic(Int64).new(0_i64)
+
+  # The decoder for *oid*; `Bytes` for an OID nobody registered.
+  def self.from_oid(oid : Int32) : Decoder
+    table.from_oid(oid)
+  end
+
+  # Registers *decoder* for each of its OIDs, in place of any registered
+  # before for them. A decoder is read by every thread, so it is `Share`:
+  # its fields are set in `initialize` only, and are `Share` themselves.
+  def self.register_decoder(decoder : Decoder) : Nil
+    oids = List(Int32).new(decoder.oids)
+    # A task cancelled while it waits for the lock still registers.
+    while @@registry.lock { |registry| registry.register(oids, decoder) }.is_a?(Cancelled)
+    end
+    @@generation.add(1_i64)
+    nil
+  end
+
+  # The count of registrations so far.
+  def self.generation : Int64
+    @@generation.get
+  end
+
+  # The table of every registration so far.
+  def self.table : DecoderTable
+    while (table = @@registry.get { |registry| registry.table }).is_a?(Cancelled)
+    end
+    table
   end
 
   def self.decode_array_header(io : ByteSource) : ArrayHeader | DBError
