@@ -6,7 +6,6 @@ import std/file
 import std/log::{Log, MemoryBackend, Severity}
 import db/db/spec::{describe, it}
 import pg/pq/conninfo::{ConnInfo}
-import pg/pq/pgpass::{LOG}
 import pg/testing/spec_helper::{env_var_bubble}
 
 def create_empty_pgpass_file(& : String -> Nil) : Nil
@@ -34,9 +33,10 @@ end
 # the block runs.
 def capture_pg_log(& : -> Nil) : MemoryBackend
   backend = MemoryBackend.new
-  previous = LOG.own_backend
-  LOG.backend = backend
-  defer LOG.backend = previous
+  logger = Log.for("pg")
+  previous = logger.own_backend
+  logger.backend = backend
+  defer logger.backend = previous
   yield
   backend
 end

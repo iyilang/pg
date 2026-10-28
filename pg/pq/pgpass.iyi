@@ -8,10 +8,48 @@ import std/env
 import std/file
 import std/path::{Path}
 import std/text
-import std/log::{Log, Logger}
+import std/log::{Log, Logger, Severity}
+import std/mutex::{Mutex}
+
+# A std `Logger` behind a lock, so a task on any worker may log through it:
+# std's `Logger` is not `Share` - `level=`, `backend=` and `for` change it
+# in place - and a connection logs from whichever worker its task runs on.
+# The message is built only when the logger takes its severity, as the
+# `Logger`'s block forms build it.
+#
+# The logger itself is `Log.for(source)`'s, which a program configures as
+# any std logger: `Log.for("pg").level = Severity::Debug`, at startup.
+pub class SharedLog
+  @logger : Mutex(Logger)
+
+  def initialize(source : String)
+    @logger = Mutex.new { Log.for(source) }
+  end
+
+  def debug(& : -> String) : Nil
+    write(Severity::Debug) { yield }
+  end
+
+  def warn(& : -> String) : Nil
+    write(Severity::Warn) { yield }
+  end
+
+  def error(& : -> String) : Nil
+    write(Severity::Error) { yield }
+  end
+
+  # A task cancelled while it waits for the lock writes nothing.
+  private def write(severity : Severity, & : -> String) : Nil
+    wanted = @logger.get { |log| severity >= log.level && severity != Severity::None }
+    return unless wanted == true
+    message = yield
+    @logger.lock { |log| log.log(severity, message) }
+    nil
+  end
+end
 
 # The logger for this library, crystal-pg's `PQ::Log`; its source is "pg".
-pub LOG = Log.for("pg")
+pub LOG = SharedLog.new("pg")
 
 pub class PgPass
   # The password the file holds for *host*, *port*, *db* and *user*, or nil.

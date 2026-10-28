@@ -19,15 +19,15 @@ module pg/replication
 import std/int
 import std/uri::{URI}
 import std/time::{Span}
-import std/log::{Log}
 import db
 import db/db/errors::{DBError}
 import pg/pq/errors::{StreamError}
 import pg/pq/stream::{Stream}
+import pg/pq/pgpass::{SharedLog}
 import pg/core::{PGConnection}
 import pg/replication/messages::*
 
-LOG = Log.for("pg.replication")
+LOG = SharedLog.new("pg.replication")
 
 # What a `Connection` hands the stream to. crystal-pg's `module Handler`,
 # included by the user's class; here an abstract class to inherit, with a
@@ -211,11 +211,11 @@ pub class Connection
       break if closed?
       case result
       when StreamError
-        LOG.warn("Replication connection lost; reconnecting: #{result.message}")
+        LOG.warn { "Replication connection lost; reconnecting: #{result.message}" }
       when DBError
-        LOG.error("Unexpected error in replication loop; reconnecting: #{result.message}")
+        LOG.error { "Unexpected error in replication loop; reconnecting: #{result.message}" }
       else
-        LOG.warn("Replication connection lost; reconnecting")
+        LOG.warn { "Replication connection lost; reconnecting" }
       end
 
       # The connection dropped. Re-establish it, backing off if the server
@@ -228,7 +228,7 @@ pub class Connection
         if reconnected.is_a?(DBError)
           backoff = backoff + backoff
           backoff = MAX_RECONNECT_BACKOFF if backoff > MAX_RECONNECT_BACKOFF
-          LOG.error("Failed to reconnect replication; retrying in #{backoff.total_seconds}s: #{reconnected.message}")
+          LOG.error { "Failed to reconnect replication; retrying in #{backoff.total_seconds}s: #{reconnected.message}" }
         else
           backoff = BASE_RECONNECT_BACKOFF
           break

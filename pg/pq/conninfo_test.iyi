@@ -2,11 +2,10 @@
 module pg/pq/conninfo_test
 
 import std/env
-import std/log::{MemoryBackend, Severity}
+import std/log::{Log, MemoryBackend, Severity}
 import db/db/errors::*
 import db/db/spec::{describe, it, expect_error}
 import pg/pq/conninfo::{ConnInfo}
-import pg/pq/pgpass::{LOG}
 import pg/testing/spec_helper::{env_var_bubble}
 
 def assert_default_params(ci : ConnInfo) : Nil
@@ -159,10 +158,11 @@ describe "PQ::ConnInfo.from_conninfo_string" do
 
   it "reports a parameter it ignores, and not iyi-db's pool options" do
     backend = MemoryBackend.new
-    previous = LOG.own_backend
-    LOG.backend = backend
+    logger = Log.for("pg")
+    previous = logger.own_backend
+    logger.backend = backend
     parse("postgres://host/db?sslmdoe=verify-full&max_pool_size=2&application_name=x&connect_timeout=5&options=-c%20a%3Db")
-    LOG.backend = previous
+    logger.backend = previous
     warnings = backend.entries.select { |e| e.severity >= Severity::Warn }.map(&.message)
     assert warnings == ["Ignoring the connection parameter sslmdoe, which this driver does not support"], warnings.inspect
   end
