@@ -67,9 +67,10 @@ end
 The URI's query takes iyi-db's pool options (`max_pool_size`, ...) and the
 connection's: `application_name`, `sslmode`, `sslrootcert`, `sslcert`,
 `sslkey`, `ssl_min_protocol_version`, `channel_binding`, `auth_methods`,
-`connect_timeout`, `options`, `replication`, and `host` for a Unix socket
-directory. A `key=value` string takes the same keys, a value with spaces
-single-quoted (`options='-c search_path=app'`). Missing parts come from
+`connect_timeout`, `options`, `replication`, `statement_cache_capacity`
+(see Prepared statements), and `host` for a Unix socket directory. A
+`key=value` string takes the same keys, a value with spaces single-quoted
+(`options='-c search_path=app'`). Missing parts come from
 `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGAPPNAME`,
 `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGCHANNELBINDING`,
 `PGSSLMINPROTOCOLVERSION`, `PGCONNECT_TIMEOUT`, `PGOPTIONS` and the password
@@ -86,6 +87,46 @@ command-line options: `options=-c%20search_path%3Dapp`.
 
 A server error is a `PQError` (module `pg/pq/errors`) whose `fields` hold
 what the server sent: `err.field_message(:code)`, `:detail`, `:hint`, ...
+
+### Prepared statements
+
+A connection keeps the statements it runs prepared on the server, by their
+text. The first execution of a query on a connection parses it under a name
+(`iyi_pg_1`, ...) and describes its rows, in the same round trip as the
+execution; every later one sends only Bind, Execute and Sync, so the server
+neither parses nor plans it again. pgx keeps such a cache; crystal-pg, and
+this driver up to 0.3.1, parse an unnamed statement every time
+([#1](https://github.com/iyilang/pg/issues/1)).
+
+The cache holds `statement_cache_capacity` statements per connection (512,
+pgx's default, unless given), the least recently used one closed on the
+server to make room. A kept statement the server can no longer bind as it
+was prepared - dropped by a `DEALLOCATE`, or out of date after an `ALTER
+TABLE` changed the type of its rows (`cached plan must not change result
+type`) or of a column under one of its parameters - is prepared anew and
+the query run again, once, when that is safe: outside a transaction block.
+Inside one, the transaction is aborted and the error is answered; the
+statement is prepared anew after it. `DISCARD ALL` and `DEALLOCATE ALL`
+empty the cache.
+
+A kept statement keeps the parameter types the server inferred when it was
+prepared. DDL on the same connection (`CREATE ...`, `ALTER ...`,
+`DROP ...`) empties its cache, so its statements are prepared again against
+the new schema. DDL from another session is seen only when a kept statement
+then fails to bind, as above: a column changed to a type an argument
+converts to without an error - `timestamp` to `timestamptz` on a server not
+in UTC, say - leaves a statement prepared before converting to the old
+type, as pgx's do. Run such a migration with the cache off, or reconnect
+after it.
+
+Turn it off with `statement_cache_capacity=0`, or iyi-db's
+`prepared_statements_cache=false` - behind a pooler that does not keep a
+session for a client, say (PgBouncer in transaction mode) - and every
+statement is parsed each time it runs, as the unnamed statement. An
+unprepared statement (`db.unprepared.exec(...)`, or
+`prepared_statements=false`) always is. A connection's cache is
+`pg_conn.connection.statement_cache`, and `pg_conn.connection.parse_count`
+counts the Parse messages it has sent.
 
 ### TLS
 
@@ -289,6 +330,13 @@ in its canonical form, `[1,5]` as `[1,6)`. A `MultirangeValue` holds its
 `MultirangeDecoder.new([multirange_oid], subtype_oid)` (module `pg/range`;
 the OIDs are in `pg_range`).
 
+Every thread reads the same decoders, so a `Decoder` of your own is
+`Share`: its fields are set in `initialize` only, and are `Share`
+themselves (a `List`, not an `Array`). A decoder may be registered at any
+time; a connection reads its columns through a table of the registry it
+holds, taken again after a registration, so a column is read without a
+lock.
+
 Values bound as arguments are iyi-db's `DBValue`s: the scalars, `Time` (to
 the microsecond, PostgreSQL's precision), `Span`, `Bytes`, arrays, and this
 driver's value classes (`Numeric`, `Interval`, the geometric types,
@@ -344,7 +392,7 @@ mistake that postgres continues to have this as an option at all.
 |---|---|
 | `pg` (the root module) | `Pg.connect`, `connect_listen`, `connect_replication`, `ListenConnection`, `VERSION` |
 | `pg/core` | `PGDriver`, `PGConnection`, `PGStatement`, `PGResultSet`, `PGConnectionBuilder`; registers the driver |
-| `pg/decoder` | `Decoder` and one per type, `Decoders` (`from_oid`, `register_decoder`), `UUIDValue`, `JSONValue` |
+| `pg/decoder` | `Decoder` and one per type, `Decoders` (`from_oid`, `register_decoder`), `DecoderTable`, `UUIDValue`, `JSONValue` |
 | `pg/numeric`, `pg/interval`, `pg/geo`, `pg/record`, `pg/time_tz`, `pg/inet` | the value classes |
 | `pg/range` | `RangeValue`, `MultirangeValue`, `RangeDecoder`, `MultirangeDecoder` |
 | `pg/escape` | `EscapeHelper`: `escape_identifier`, `escape_literal` |
@@ -353,7 +401,8 @@ mistake that postgres continues to have this as an option at all.
 | `pg/replication/messages` | the replication frames and WAL messages: `XLogData`, `Begin`, `Insert`, ... |
 | `pg/errors` | `PGError`, `RuntimeError` |
 | `pg/pq/connection` | `PQConnection`, the protocol session |
-| `pg/pq/conninfo`, `pg/pq/pgpass` | `ConnInfo`, `PgPass` |
+| `pg/pq/conninfo`, `pg/pq/pgpass` | `ConnInfo`, `PgPass`; `LOG`, the driver's `SharedLog` |
+| `pg/pq/statement_cache` | `StatementCache`, a session's prepared statements, and `CachedStatement` |
 | `pg/pq/ssl` | the `TlsConfig` a `ConnInfo` asks for: roots, client certificate; the channel binding's certificate hash |
 | `pg/pq/frame`, `pg/pq/param`, `pg/pq/stream`, `pg/pq/scram` | messages, parameter encoding, the buffered socket or TLS session, SCRAM |
 | `pg/pq/errors` | `ConnectionError`, `StreamError`, `PQError`, `ErrorField` |
@@ -374,6 +423,8 @@ mistake that postgres continues to have this as an option at all.
 | `CopyResult < IO` | `CopyResult` with `read`, `read_char`, `gets_to_end`, `write`, `<<`, `close` answering errors | `IyiIO` cannot answer one |
 | enums bound as their value | pass `.value` | an enum is not a `DBValue` |
 | `sslmode=require` and `prefer` encrypt without checking the certificate; `verify-ca` checks no host name | every certificate is checked, chain and host name: against `sslrootcert` or `root.crt`, else the system's roots | `std/tls` has no way to turn the checks off |
+| every execution parses an unnamed statement: Parse, Bind, Describe, Execute, Sync | a statement is kept prepared per connection after its first execution: Bind, Execute, Sync | the server parsed and planned each query again ([#1](https://github.com/iyilang/pg/issues/1)) |
+| `PQ::Log`, a `::Log` | `LOG` is a `SharedLog`, a `Logger` behind a `Mutex`; configure `Log.for("pg")` | std's `Logger` is not `Share`, and a connection logs from any worker |
 
 ## Development
 
