@@ -9,28 +9,31 @@ import std/path::{Path}
 import std/text
 import std/uri::{URI, Params}
 import std/user::{User}
+import std/list::{List}
 import db/db/errors::{DBError, ArgumentError}
 import pg/pq/pgpass::{PgPass, LOG}
 
 pub struct ConnInfo
-  SOCKET_SEARCH = ["/run/postgresql", "/tmp", "/var/run/postgresql"]
+  # These tables are `List`s, which any thread may read (SPEC.md III.4.4):
+  # a connection is opened from whichever worker its task runs on.
+  SOCKET_SEARCH = List(String).new(["/run/postgresql", "/tmp", "/var/run/postgresql"])
 
-  SUPPORTED_AUTH_METHODS = ["cleartext", "md5", "scram-sha-256", "scram-sha-256-plus"]
+  SUPPORTED_AUTH_METHODS = List(String).new(["cleartext", "md5", "scram-sha-256", "scram-sha-256-plus"])
 
-  SSL_MODES = [:disable, :allow, :prefer, :require, :"verify-ca", :"verify-full"]
+  SSL_MODES = List(Symbol).new([:disable, :allow, :prefer, :require, :"verify-ca", :"verify-full"])
 
   # The keys a URI's query or a `key=value` string may hold besides the ones
   # `handle_param` reads: the connection's own, and iyi-db's pool options.
   # Any other is reported, not silently dropped.
-  KNOWN_KEYS = [
+  KNOWN_KEYS = List(String).new([
     "host", "port", "dbname", "user", "password", "application_name", "replication",
     "initial_pool_size", "max_pool_size", "max_idle_pool_size", "checkout_timeout",
     "retry_attempts", "retry_delay", "prepared_statements", "prepared_statements_cache",
-  ]
+  ])
 
   # The parameters a `PG*` variable gives when the URL or string does not,
   # each with its variable, as libpq has them.
-  ENV_DEFAULTS = [
+  ENV_DEFAULTS = List(Tuple(String, String)).new([
     {"sslmode", "PGSSLMODE"},
     {"sslrootcert", "PGSSLROOTCERT"},
     {"sslcert", "PGSSLCERT"},
@@ -39,10 +42,10 @@ pub struct ConnInfo
     {"ssl_min_protocol_version", "PGSSLMINPROTOCOLVERSION"},
     {"connect_timeout", "PGCONNECT_TIMEOUT"},
     {"options", "PGOPTIONS"},
-  ]
+  ])
 
   # The `ssl_min_protocol_version`s std/tls speaks.
-  TLS_VERSIONS = ["TLSv1.2", "TLSv1.3"]
+  TLS_VERSIONS = List(String).new(["TLSv1.2", "TLSv1.3"])
 
   # The prepared statements a session keeps unless `statement_cache_capacity`
   # says otherwise: pgx's default.
