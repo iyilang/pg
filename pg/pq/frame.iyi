@@ -81,6 +81,8 @@ pub abstract class Frame
     when 'Z' then ReadyForQuery.new(bytes)
     when '1' then ParseComplete.new(bytes)
     when '2' then BindComplete.new(bytes)
+    when '3' then CloseComplete.new(bytes)
+    when 't' then ParameterDescription.new(bytes)
     when 'T' then RowDescription.new(bytes)
     when 'A' then NotificationResponse.new(bytes)
     when 'E' then ErrorResponse.new(bytes)
@@ -349,6 +351,35 @@ pub abstract class Frame
       last = command.split.last?
       (last && last.to_i64?) || 0_i64
     end
+
+    # Whether the command dropped every prepared statement of the session:
+    # `DISCARD ALL` or `DEALLOCATE ALL`. The tag's length is looked at
+    # first, so the other commands' tags are not made into strings.
+    def drops_statements? : Bool
+      size = @bytes.size
+      return false unless size == 12 || size == 15
+      tag = command
+      tag == "DISCARD ALL" || tag == "DEALLOCATE ALL"
+    end
+
+    # Whether the command was DDL - `CREATE ...`, `DROP ...`, `ALTER ...` -
+    # after which a prepared statement's parameter types, inferred when it
+    # was prepared, may no longer be what its text would give.
+    def changes_schema? : Bool
+      tag_starts_with?("CREATE ") || tag_starts_with?("DROP ") || tag_starts_with?("ALTER ")
+    end
+
+    private def tag_starts_with?(prefix : String) : Bool
+      size = prefix.bytesize
+      return false if @bytes.size <= size
+      bytes = prefix.to_unsafe
+      i = 0
+      while i < size
+        return false if @bytes[i] != bytes[i]
+        i += 1
+      end
+      true
+    end
   end
 
   class ParseComplete < Frame
@@ -358,6 +389,27 @@ pub abstract class Frame
 
   class BindComplete < Frame
     def initialize(bytes : Bytes)
+    end
+  end
+
+  class CloseComplete < Frame
+    def initialize(bytes : Bytes)
+    end
+  end
+
+  # The types of a prepared statement's parameters, as the server inferred
+  # them, by OID.
+  class ParameterDescription < Frame
+    getter type_oids : Array(Int32)
+
+    def initialize(bytes : Bytes)
+      pos, count = i16(0, bytes)
+      @type_oids = [] of Int32
+      # the count is unsigned on the wire: up to 65535 parameters
+      (count.to_i32 & 0xFFFF).times do
+        pos, oid = i32(pos, bytes)
+        @type_oids << oid
+      end
     end
   end
 

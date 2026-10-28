@@ -19,7 +19,7 @@ import db
 import db/db/errors::*
 import db/db/value::{DBValue, ExecResult}
 import db/db/core::{Driver, ConnectionBuilder, ResultSet, Statement, Connection, ConnectionLost}
-import pg/pq/errors::{StreamError}
+import pg/pq/errors::{StreamError, PQError}
 import pg/pq/stream::{ByteSource}
 import pg/pq/frame::*
 import pg/pq/param::{Param}
@@ -349,8 +349,17 @@ pub class PGResultSet < ResultSet
 end
 
 pub class PGStatement < Statement
-  def initialize(connection : Connection, @conn : PQConnection, command : String)
+  # Whether the statement runs as a statement the session keeps prepared
+  # (`StatementCache`); otherwise it is parsed each time it runs, as the
+  # unnamed statement.
+  @cached : Bool
+
+  def initialize(connection : Connection, @conn : PQConnection, command : String, @cached : Bool = false)
     super(connection, command)
+  end
+
+  def cached? : Bool
+    @cached
   end
 
   protected def conn : PQConnection
@@ -383,13 +392,21 @@ pub class PGStatement < Statement
   # The most parameters a Bind message counts (an unsigned 16-bit number).
   MAX_PARAMETERS = 65535
 
-  # Parses, binds and executes the statement with the extended query
-  # protocol, and reads up to the description of its rows.
+  # Parses (unless the session keeps the statement prepared), binds and
+  # executes the statement with the extended query protocol, and reads up
+  # to the description of its rows.
   private def start_query(args : Array(DBValue)) : PGResultSet | DBError
     if args.size > MAX_PARAMETERS
       return DBError.new("#{args.size} parameters: a statement takes at most #{MAX_PARAMETERS}")
     end
     params = args.map { |arg| Param.encode(arg) }
+    return run_cached(params, retry: true) if @cached
+    run_unnamed(params)
+  end
+
+  # Parse, Bind, Describe portal, Execute and Sync: the unnamed statement,
+  # parsed and planned again on every execution.
+  private def run_unnamed(params : Array(Param)) : PGResultSet | DBError
     @conn.send_parse_message(command)
     @conn.send_bind_message(params)
     @conn.send_describe_portal_message
@@ -397,16 +414,98 @@ pub class PGStatement < Statement
     @conn.send_sync_message!
     @conn.expect_frame(Frame::ParseComplete)!
     @conn.expect_frame(Frame::BindComplete)!
-    frame = @conn.read!
-    fields = case frame
-             when Frame::RowDescription
-               frame.fields
-             when Frame::NoData
-               nil
-             else
-               return DBError.new("expected RowDescription or NoData, got #{frame}")
-             end
+    PGResultSet.new(self, @conn, row_fields!)
+  end
+
+  # Bind, Execute and Sync for the statement the session keeps prepared for
+  # this query. When it keeps none, the statement is prepared in the same
+  # exchange: Parse under a name of the cache's, and Describe statement,
+  # whose row description is kept with the name. A Close for each statement
+  # the cache gave up goes first.
+  #
+  # A kept statement the server refuses to bind as out of date (see
+  # `give_up_stale`) is given up, and the query runs again, prepared anew -
+  # once, while *retry*, and only when the error left the session outside a
+  # transaction block: inside one, the transaction is aborted and the error
+  # is the caller's.
+  private def run_cached(params : Array(Param), retry : Bool) : PGResultSet | DBError
+    cache = @conn.statement_cache
+    statement = cache.fetch?(command)
+    name = statement ? statement.name : cache.next_name
+    closing = cache.take_closing
+    closing.each { |old| @conn.send_close_statement_message(old) }
+    unless statement
+      @conn.send_parse_message(command, name)
+      @conn.send_describe_statement_message(name)
+    end
+    @conn.send_bind_message(params, name)
+    @conn.send_execute_message
+    @conn.send_sync_message!
+    closing.each do |_|
+      closed = @conn.expect_frame(Frame::CloseComplete)
+      return closed if closed.is_a?(DBError)
+    end
+
+    if statement
+      bound = @conn.expect_frame(Frame::BindComplete)
+      if bound.is_a?(DBError)
+        if give_up_stale(bound, params) && retry && @conn.transaction_status == 'I'
+          return run_cached(params, retry: false)
+        end
+        return bound
+      end
+      return PGResultSet.new(self, @conn, statement.fields)
+    end
+
+    @conn.expect_frame(Frame::ParseComplete)!
+    @conn.expect_frame(Frame::ParameterDescription)!
+    fields = row_fields
+    if fields.is_a?(DBError)
+      # prepared, but not kept: the server is asked to close it
+      cache.close_later(name)
+      return fields
+    end
+    cache.store(command, name, fields)
+    @conn.expect_frame(Frame::BindComplete)!
     PGResultSet.new(self, @conn, fields)
+  end
+
+  # The fields of the RowDescription that comes next, nil for NoData.
+  private def row_fields : Array(Field) | Nil | DBError
+    frame = @conn.read!
+    case frame
+    when Frame::RowDescription
+      frame.fields
+    when Frame::NoData
+      nil
+    else
+      DBError.new("expected RowDescription or NoData, got #{frame}")
+    end
+  end
+
+  # Gives up the statement kept for this query when *error*, the server's
+  # answer to its Bind, may be the statement's being out of date rather
+  # than the query's fault; whether it did. Out of date: the statement is
+  # gone (26000, after a `DEALLOCATE`; every kept statement is given up,
+  # as a `DEALLOCATE ALL` or `DISCARD ALL` dropped them all), its rows
+  # changed type (0A000, "cached plan must not change result type", after
+  # an `ALTER TABLE`), analysing it again against the schema fails (class
+  # 42), or an argument does not convert to a parameter type inferred when
+  # it was prepared, which may no longer be the column's (class 22, for a
+  # statement with parameters). A query at fault fails the same way when
+  # prepared anew, and that error is answered.
+  private def give_up_stale(error : DBError, params : Array(Param)) : Bool
+    return false unless error.is_a?(PQError)
+    code = error.field_message(:code) || ""
+    cache = @conn.statement_cache
+    if code == "26000"
+      cache.evict_all
+    elsif code == "0A000" || code.starts_with?("42") || (code.starts_with?("22") && !params.empty?)
+      cache.evict(command)
+    else
+      return false
+    end
+    true
   end
 end
 
@@ -426,10 +525,14 @@ pub class PGConnection < Connection
     PGConnection.new(options, pq)
   end
 
+  # A statement the session keeps prepared after its first execution, unless
+  # `prepared_statements_cache=false` or `statement_cache_capacity=0`.
   def build_prepared_statement(query : String) : Statement | DBError
-    PGStatement.new(self, @connection, query)
+    cached = prepared_statements_cache? && @connection.statement_cache.enabled?
+    PGStatement.new(self, @connection, query, cached: cached)
   end
 
+  # A statement parsed each time it runs, as the unnamed statement.
   def build_unprepared_statement(query : String) : Statement | DBError
     PGStatement.new(self, @connection, query)
   end
