@@ -1,0 +1,138 @@
+# The statements a session keeps prepared on the server, by query text, so
+# a query run again is bound and executed without being parsed and planned
+# again (iyilang/pg#1). pgx's statement cache, which crystal-pg has no
+# counterpart of.
+#
+# The parameters' types are not part of the key: a statement is parsed with
+# none given, so the server infers them from the query text alone, as it
+# does for the unnamed statement each execution parsed before.
+module pg/pq/statement_cache
+
+import pg/pq/frame::{Field}
+
+# One statement the server holds prepared under *name*, and the description
+# of its rows: nil for a statement that returns none.
+pub class CachedStatement
+  getter name : String
+  getter fields : Array(Field)?
+  # When it was last used, on its cache's clock.
+  property used : Int64
+
+  def initialize(@name : String, @fields : Array(Field)?, @used : Int64)
+  end
+end
+
+# At most `capacity` prepared statements, the least recently used one
+# making room for a new one. A capacity of 0 keeps none: every statement is
+# parsed each time it runs, as the unnamed statement.
+#
+# The server is not told here: the names of the statements it should close
+# wait in `closing` until the session's next exchange sends a Close for each.
+pub class StatementCache
+  getter capacity : Int32
+  @statements : Hash(String, CachedStatement)
+  # Counts uses, so the least recently used statement is the one whose last
+  # use is the smallest. A hit costs one write; the scan for the smallest
+  # happens only when a full cache takes a new statement.
+  @clock = 0_i64
+  # Numbers the names, which are never used twice in a session.
+  @serial = 0_i64
+  @closing : Array(String)
+
+  def initialize(@capacity : Int32)
+    @statements = {} of String => CachedStatement
+    @closing = [] of String
+  end
+
+  def enabled? : Bool
+    @capacity > 0
+  end
+
+  # How many statements are prepared.
+  def size : Int32
+    @statements.size
+  end
+
+  def includes?(query : String) : Bool
+    @statements.has_key?(query)
+  end
+
+  # The statement prepared for *query*, now its most recently used one; nil
+  # when there is none.
+  def fetch?(query : String) : CachedStatement?
+    if statement = @statements[query]?
+      @clock += 1
+      statement.used = @clock
+    end
+    statement
+  end
+
+  # A name for a statement about to be prepared. A full cache makes room
+  # first, by giving up its least recently used statement.
+  def next_name : String
+    evict_least_recent if @statements.size >= @capacity
+    @serial += 1
+    "iyi_pg_#{@serial}"
+  end
+
+  # *query* is prepared on the server under *name*, its rows described by
+  # *fields*.
+  def store(query : String, name : String, fields : Array(Field)?) : Nil
+    @clock += 1
+    @statements[query] = CachedStatement.new(name, fields, @clock)
+  end
+
+  # Gives up the statement prepared for *query*; the server is asked to
+  # close it.
+  def evict(query : String) : Nil
+    if statement = @statements.delete(query)
+      @closing << statement.name
+    end
+  end
+
+  # Gives up every statement; the server is asked to close each.
+  def evict_all : Nil
+    @statements.each_value { |statement| @closing << statement.name }
+    @statements.clear
+  end
+
+  # The server dropped every statement of the session (`DISCARD ALL`,
+  # `DEALLOCATE ALL`): there is nothing left to close either.
+  def forget_all : Nil
+    @statements.clear
+    @closing.clear
+  end
+
+  # A statement prepared under *name* that the cache does not hold, to be
+  # closed on the server.
+  def close_later(name : String) : Nil
+    @closing << name
+  end
+
+  # Whether names wait to be closed on the server.
+  def closing? : Bool
+    !@closing.empty?
+  end
+
+  # The names waiting to be closed, which the caller now sends a Close for;
+  # the cache forgets them.
+  def take_closing : Array(String)
+    names = @closing
+    @closing = [] of String
+    names
+  end
+
+  private def evict_least_recent : Nil
+    oldest = nil.as(String?)
+    oldest_use = 0_i64
+    @statements.each do |query, statement|
+      if oldest.nil? || statement.used < oldest_use
+        oldest = query
+        oldest_use = statement.used
+      end
+    end
+    if query = oldest
+      evict(query)
+    end
+  end
+end

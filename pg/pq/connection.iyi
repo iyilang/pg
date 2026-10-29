@@ -20,6 +20,8 @@ import pg/pq/stream::{Stream}
 import pg/pq/conninfo::{ConnInfo}
 import pg/pq/frame::*
 import pg/pq/param::{Param}
+import pg/pq/statement_cache::{StatementCache}
+import pg/decoder::{Decoders, DecoderTable}
 import pg/pq/scram::{SaslContext, md5_password}
 import pg/pq/ssl::{tls_config, server_end_point}
 import pg/pq/pgpass::{LOG}
@@ -41,11 +43,22 @@ pub class PQConnection
   # When the attempt that opened this session runs out of `connect_timeout`,
   # on the monotonic clock in milliseconds; nil for no bound.
   @deadline_ms : Int64? = nil
+  # The statements this session keeps prepared on the server.
+  getter statement_cache : StatementCache
+  # The Parse messages this session has sent: one for every statement it
+  # prepared, named or unnamed.
+  getter parse_count : Int64 = 0_i64
+  # The transaction status of the last ReadyForQuery: `'I'` idle, `'T'` in
+  # a transaction block, `'E'` in a failed one.
+  getter transaction_status : Char = 'I'
+  # The decoders this session reads columns with; see `decoders`.
+  @decoders : DecoderTable? = nil
 
   def initialize(@stream : Stream, @conninfo : ConnInfo)
     @server_parameters = {} of String => String
     @notice_handler = ->(notice : Notice) { nil }
     @notification_handler = ->(notification : Notification) { nil }
+    @statement_cache = StatementCache.new(@conninfo.statement_cache_capacity)
   end
 
   # The code an SSLRequest sends where a startup message sends its
@@ -59,6 +72,17 @@ pub class PQConnection
   # How much sooner than its deadline a wait may end and still be taken
   # for the timeout's: a socket's timer fires on the platform's tick.
   TIMEOUT_SLACK_MS = 50
+
+  # The decoders this session reads columns with: the registry's table,
+  # taken again only when a decoder was registered after it, so reading a
+  # column takes no lock.
+  def decoders : DecoderTable
+    table = @decoders
+    return table if table && table.current?(Decoders.generation)
+    table = Decoders.table
+    @decoders = table
+    table
+  end
 
   # The process id of the session's backend on the server, 0 when the
   # server named none.
@@ -341,6 +365,9 @@ pub class PQConnection
   end
 
   # `true` when *frame* was handled here and the caller reads the next one.
+  # A ReadyForQuery's transaction status is noted, and a command that
+  # dropped the session's prepared statements, or changed the schema,
+  # empties its cache; both are still the caller's to read.
   private def handle_async_frames(frame : Frame) : Bool | DBError
     case frame
     when Frame::ErrorResponse
@@ -370,6 +397,22 @@ pub class PQConnection
         # nothing to check
       end
       true
+    when Frame::ReadyForQuery
+      @transaction_status = frame.transaction_status
+      false
+    when Frame::CommandComplete
+      if frame.drops_statements?
+        @statement_cache.forget_all
+      elsif frame.changes_schema?
+        # A statement prepared before keeps the parameter types inferred
+        # then, and a value converts to an old one without an error: a
+        # `Time` bound to a `timestamp` parameter of a table recreated
+        # with a `timestamptz` column lost its zone. Prepared anew, the
+        # types are the new schema's. DDL from another session is not
+        # seen here; see the README.
+        @statement_cache.evict_all
+      end
+      false
     else
       false
     end
@@ -697,27 +740,33 @@ pub class PQConnection
     @stream.flush
   end
 
-  def send_parse_message(query : String) : Nil
+  # Parses *query* into the prepared statement *name*, the unnamed one when
+  # it is empty, leaving the parameters' types to the server.
+  def send_parse_message(query : String, name : String = "") : Nil
+    @parse_count += 1
     @stream.write_char('P')
-    @stream.write_i32(query.bytesize + 4 + 1 + 2 + 1)
-    @stream.write_byte(0_u8) # prepared statment name
+    @stream.write_i32(4 + name.bytesize + 1 + query.bytesize + 1 + 2)
+    @stream.write(name)
+    @stream.write_byte(0_u8)
     @stream.write(query)
     @stream.write_byte(0_u8)
     @stream.write_i16(0) # don't give any param types
   end
 
-  # *result_format* 1 asks for binary results, which every decoder reads; 0
-  # asks for text.
-  def send_bind_message(params : Array(Param), result_format : Int32 = 1) : Nil
+  # Binds *params* to the prepared statement *statement* (the unnamed one
+  # when it is empty) in the unnamed portal. *result_format* 1 asks for
+  # binary results, which every decoder reads; 0 asks for text.
+  def send_bind_message(params : Array(Param), statement : String = "", result_format : Int32 = 1) : Nil
     nparams = params.size
     total_size = params.reduce(0) do |acc, p|
       acc + 4 + (p.size == -1 ? 0 : p.size)
     end
 
     @stream.write_char('B')
-    @stream.write_i32(4 + 1 + 1 + 2 + (2 * nparams) + 2 + total_size + 2 + 2)
-    @stream.write_byte(0_u8)   # unnamed destination portal
-    @stream.write_byte(0_u8)   # unnamed prepared statment
+    @stream.write_i32(4 + 1 + statement.bytesize + 1 + 2 + (2 * nparams) + 2 + total_size + 2 + 2)
+    @stream.write_byte(0_u8) # unnamed destination portal
+    @stream.write(statement)
+    @stream.write_byte(0_u8)
     @stream.write_i16(nparams) # number of params format codes to follow
     params.each { |p| @stream.write_i16(p.format.to_i32) }
     @stream.write_i16(nparams) # number of params to follow
@@ -733,6 +782,27 @@ pub class PQConnection
     @stream.write_char('D')
     @stream.write_i32(4 + 1 + 1)
     @stream.write_char('P')
+    @stream.write_byte(0_u8)
+  end
+
+  # Asks for the prepared statement *name*'s parameter types and the
+  # description of its rows: a ParameterDescription, then a RowDescription
+  # or NoData.
+  def send_describe_statement_message(name : String) : Nil
+    @stream.write_char('D')
+    @stream.write_i32(4 + 1 + name.bytesize + 1)
+    @stream.write_char('S')
+    @stream.write(name)
+    @stream.write_byte(0_u8)
+  end
+
+  # Closes the prepared statement *name*: a CloseComplete, even when the
+  # session has no statement by that name.
+  def send_close_statement_message(name : String) : Nil
+    @stream.write_char('C')
+    @stream.write_i32(4 + 1 + name.bytesize + 1)
+    @stream.write_char('S')
+    @stream.write(name)
     @stream.write_byte(0_u8)
   end
 

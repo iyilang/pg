@@ -1,3 +1,68 @@
+## Unreleased
+
+A statement cache, and the driver's module state made safe to reach from
+every worker.
+
+* Each connection keeps the statements it runs prepared on the server
+  ([#1](https://github.com/iyilang/pg/issues/1)). A query's first execution
+  on a connection parses it under a name and describes it, in the same
+  round trip as the execution; every later one sends only Bind, Execute and
+  Sync, where each sent Parse, Bind, Describe, Execute and Sync before. The
+  cache is an LRU of `statement_cache_capacity` statements (512, pgx's
+  default), a Close for each one given up going with the next exchange.
+  `statement_cache_capacity=0`, or `prepared_statements_cache=false`, turns
+  it off; unprepared statements are parsed every time, as before.
+  - A kept statement the server refuses to bind as out of date - 26000
+    (dropped), 0A000 (`cached plan must not change result type`), class 42,
+    or class 22 for one with parameters - is prepared anew and the query run
+    again, once, outside a transaction block; inside one the error is
+    answered. `DISCARD ALL` and `DEALLOCATE ALL` empty the cache, and DDL
+    on the same connection (`CREATE`, `ALTER`, `DROP`) gives up every kept
+    statement: one keeps the parameter types inferred when it was prepared,
+    and the suite's `timestamptz` read back three hours off on a server in
+    Europe/Istanbul when its INSERT kept the `timestamp` parameter of the
+    table dropped before.
+  - `PQConnection#statement_cache`, `#parse_count` (the Parse messages a
+    session sent) and `#transaction_status` (the last ReadyForQuery's).
+  - Measured on macOS 26.6, Apple M2 Pro, 10 cores (the user's machine),
+    against a throwaway PostgreSQL 14.19 there, with clients built by iyi
+    master befaa8bc4. A SELECT of four columns by primary key, 1000 times
+    on one connection, sent per query: before, a Parse, a Bind, a Describe
+    portal, an Execute and a Sync; after, a Bind, an Execute and a Sync, and
+    one Parse and one Describe statement in all. The same SELECT in a loop,
+    2 s warm-up then 10 s measured, three runs each, alternating:
+
+    | | queries/s (best of 3) | runs | postgres CPU per query |
+    |---|---:|---|---:|
+    | 1 connection, before | 15,550 | 11,734 / 14,393 / 15,550 | 23.8-27.2 us |
+    | 1 connection, after | 21,739 | 21,739 / 18,728 / 18,945 | 13.7-15.0 us |
+    | 10 connections, before | 52,610 | 52,130 / 52,610 / 51,335 | 35.7-37.0 us |
+    | 10 connections, after | 72,543 | 69,769 / 72,242 / 72,543 | 21.8-22.9 us |
+
+    Client and server shared the machine, which was at 100 % in every run;
+    the client used 659-862 % of it, its collector's helpers spinning as
+    they do on darwin at that iyi master.
+* The module state a connection reaches is `Share`, so a program that opens
+  and queries connections in parallel tasks gets no #148 reach warning from
+  this driver (iyilang/iyi#148). `@[SafeReach]` is not used: it is in no
+  released iyi (not 0.18.0 to 0.19.1), and this driver still builds with
+  iyi 0.18.0. `iyi check` (iyi master befaa8bc4) of a program that opens
+  connections and queries them in `spawn_parallel` tasks warned 12 times,
+  9 of them about this driver's constants; it warns 3 times now, all about
+  iyi-db's (`DRIVERS`, `AROUND_HOOKS`, `LOG`).
+  - `ConnInfo`'s tables (`SSL_MODES`, `KNOWN_KEYS`, `ENV_DEFAULTS`, ...)
+    and `RangeValue::QUOTED` are `List`s.
+  - `LOG` is a `SharedLog`: `Log.for("pg")` behind a `Mutex`, std's `Logger`
+    not being `Share`. Set its level or backend on `Log.for("pg")`.
+  - The decoder registry is a `DecoderRegistry` behind a `Mutex`, and a
+    connection reads its columns through a `DecoderTable` it holds - the
+    OIDs sorted in a `List`, their decoders in another - taken again only
+    after a registration, so reading a column takes no lock. A decoder is
+    `Share`: `ArrayDecoder`, `RecordDecoder`, `RangeDecoder` and
+    `MultirangeDecoder` keep their OIDs in a `List`, and `oids` answers a
+    copy. A decoder of your own sets its fields in `initialize` only, of
+    `Share` types.
+
 ## v0.3.1
 
 On iyi-db 0.3.0, for its pool and closing fixes: `Database#close` closes

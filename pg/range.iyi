@@ -11,6 +11,7 @@ module pg/range
 
 import std/int
 import std/text
+import std/list::{List}
 import db/db/errors::{DBError}
 import db/db/value::{DBValue, CustomValue}
 import pg/pq/stream::{ByteSource}
@@ -87,8 +88,9 @@ pub class RangeValue < CustomValue
     "PG::RangeValue(#{to_s})"
   end
 
-  # The characters that make a printed bound quoted, besides whitespace.
-  QUOTED = ['"', '\\', ',', '(', ')', '[', ']']
+  # The characters that make a printed bound quoted, besides whitespace: a
+  # `List`, which any thread may read.
+  QUOTED = List(Char).new(['"', '\\', ',', '(', ')', '[', ']'])
 
   # PostgreSQL's `range_bound_escape`.
   private def write_bound(io : String::Builder, bound : DBValue) : Nil
@@ -142,10 +144,15 @@ pub class RangeDecoder < Decoder
   NO_LOWER = EMPTY | LB_INF | LB_NULL
   NO_UPPER = EMPTY | UB_INF | UB_NULL
 
-  getter oids : Array(Int32)
+  @oids : List(Int32)
   getter subtype_oid : Int32
 
-  def initialize(@oids : Array(Int32), @subtype_oid : Int32)
+  def initialize(oids : Array(Int32), @subtype_oid : Int32)
+    @oids = List(Int32).new(oids)
+  end
+
+  def oids : Array(Int32)
+    @oids.to_a
   end
 
   def type_name : String
@@ -169,11 +176,16 @@ end
 # Reads the binary multirange format: the range count, then each range as
 # its size and the binary range format.
 pub class MultirangeDecoder < Decoder
-  getter oids : Array(Int32)
+  @oids : List(Int32)
   getter range : RangeDecoder
 
-  def initialize(@oids : Array(Int32), subtype_oid : Int32)
+  def initialize(oids : Array(Int32), subtype_oid : Int32)
+    @oids = List(Int32).new(oids)
     @range = RangeDecoder.new([] of Int32, subtype_oid)
+  end
+
+  def oids : Array(Int32)
+    @oids.to_a
   end
 
   def type_name : String
