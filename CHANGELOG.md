@@ -1,4 +1,4 @@
-## Unreleased
+## v0.4.0
 
 A statement cache, and the driver's module state made safe to reach from
 every worker.
