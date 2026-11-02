@@ -3,6 +3,10 @@
 A statement cache, and the driver's module state made safe to reach from
 every worker.
 
+Requires iyi 0.20.0 and iyi-db 0.4.0, whose `Database` and pool are `Share`
+and may be used by parallel tasks on every worker; iyi-db 0.4.0 requires
+iyi 0.20.0.
+
 * Each connection keeps the statements it runs prepared on the server
   ([#1](https://github.com/iyilang/pg/issues/1)). A query's first execution
   on a connection parses it under a name and describes it, in the same
@@ -44,9 +48,8 @@ every worker.
     they do on darwin at that iyi master.
 * The module state a connection reaches is `Share`, so a program that opens
   and queries connections in parallel tasks gets no #148 reach warning from
-  this driver (iyilang/iyi#148). `@[SafeReach]` is not used: it is in no
-  released iyi (not 0.18.0 to 0.19.1), and this driver still builds with
-  iyi 0.18.0. `iyi check` (iyi master befaa8bc4) of a program that opens
+  this driver (iyilang/iyi#148). `@[SafeReach]`, new in iyi 0.20.0, is
+  not used. `iyi check` (iyi master befaa8bc4) of a program that opens
   connections and queries them in `spawn_parallel` tasks warned 12 times,
   9 of them about this driver's constants; it warns 3 times now, all about
   iyi-db's (`DRIVERS`, `AROUND_HOOKS`, `LOG`).
