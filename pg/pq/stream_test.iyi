@@ -28,7 +28,7 @@ end
 def read_message(bytes : Array(UInt8)) : String
   answer = ""
   socket_pair do |client, server|
-    server.write(String.new(bytes.size) { |b| bytes.each_with_index { |byte, i| b[i] = byte } })
+    server.write(String.new(bytes))
     pq = PQConnection.new(Stream.new(client), ConnInfo.new("127.0.0.1", "db", "user", "pass", 1))
     frame = pq.read
     answer = frame.is_a?(StreamError) ? "StreamError: #{frame.message}" : frame.to_s
@@ -86,7 +86,7 @@ describe "PQ::Stream#flush" do
       end
       assert received.size == big + small.bytesize
       assert received[0, big].all? { |byte| byte == 'a'.ord.to_u8 }
-      tail = String.new(small.bytesize) { |b| b.copy_from(received.to_unsafe + big, small.bytesize) }
+      tail = String.new(received[big, small.bytesize])
       assert tail == small, tail
       assert stream.pending == 0
     end

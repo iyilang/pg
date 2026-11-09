@@ -150,9 +150,7 @@ pub abstract class Frame
 
   # *count* bytes of *bytes* from *start*, as a string.
   def self.string_of(bytes : Bytes, start : Int32, count : Int32) : String
-    String.new(count) do |buffer|
-      buffer.copy_from(bytes.to_unsafe + start, count)
-    end
+    String.new(bytes[start, count])
   end
 
   # A message this library does not know.
@@ -372,7 +370,7 @@ pub abstract class Frame
     private def tag_starts_with?(prefix : String) : Bool
       size = prefix.bytesize
       return false if @bytes.size <= size
-      bytes = prefix.to_unsafe
+      bytes = Bytes.of(prefix)
       i = 0
       while i < size
         return false if @bytes[i] != bytes[i]

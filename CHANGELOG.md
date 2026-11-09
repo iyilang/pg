@@ -1,3 +1,22 @@
+## Unreleased
+
+Requires iyi 0.21.0 and iyi-db 0.5.0. iyi 0.21.0 refuses an operation on
+raw memory in a module that is not marked `@[Unsafe("why")]` (SPEC.md
+III.13), and 0.20.x refuses the mark above a `module` header, so no source
+of this driver compiles on both.
+
+* The four modules that handle raw memory say so, each with why:
+  `pg/pq/stream` (the socket's read and write buffers),
+  `pg/pq/connection` (`read_direct`'s pointer into the caller's buffer),
+  `pg/copy_result` (a copy read straight into the caller's slice) and
+  `pg/pq/scram` (the HMAC pads and client proof written into new
+  strings).
+* `pg/core`, `pg/pq/frame`, `pg/pq/param` and `pg/replication/messages`
+  no longer touch raw memory: a string is made from bytes with
+  `String.new(bytes)` and a string's bytes are read through `Bytes.of`
+  or `byte_at`, so the compiler checks them. The tests and
+  `examples/simple_query` do the same.
+
 ## v0.4.0
 
 A statement cache, and the driver's module state made safe to reach from

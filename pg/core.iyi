@@ -288,9 +288,7 @@ pub class PGResultSet < ResultSet
   end
 
   def self.bytes_string(bytes : Bytes) : String
-    String.new(bytes.size) do |buffer|
-      buffer.copy_from(bytes.to_unsafe, bytes.size)
-    end
+    String.new(bytes)
   end
 
   private def field(index : Int32) : Field

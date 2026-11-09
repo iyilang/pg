@@ -5,6 +5,7 @@
 # Every read answers its failure: `StreamError` when the socket fails,
 # `PQError` when the server answers an `ErrorResponse`, `ConnectionError`
 # when the session cannot go on.
+@[Unsafe("read_direct hands the stream a raw pointer into the caller's buffer to fill")]
 module pg/pq/connection
 
 import std/int

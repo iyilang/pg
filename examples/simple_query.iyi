@@ -57,7 +57,7 @@ class SimpleConnection
   end
 
   private def text(bytes : Bytes) : String
-    String.new(bytes.size) { |buffer| buffer.copy_from(bytes.to_unsafe, bytes.size) }
+    String.new(bytes)
   end
 end
 
