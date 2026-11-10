@@ -14,7 +14,10 @@ are closed, and tasks are structured.
 
 ## Requirements
 
-iyi 0.20.0 or later, and iyi-db 0.4.0 (required by this package's `iyi.mod`).
+iyi 0.21.0 or later, and iyi-db 0.5.0 (required by this package's `iyi.mod`).
+0.21.0 refuses raw memory in a module that does not say it handles some
+(SPEC.md III.13), and a module says so with `@[Unsafe("why")]` above its
+`module` header, which 0.20.x refuses.
 Tested against PostgreSQL 16.
 
 ## Installation

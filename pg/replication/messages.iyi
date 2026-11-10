@@ -58,9 +58,7 @@ pub class Read
       break if byte == 0_u8
       bytes << byte
     end
-    String.new(bytes.size) do |buffer|
-      bytes.each_with_index { |b, i| buffer[i] = b }
-    end
+    String.new(bytes)
   end
 
   # An Int32 length, then that many bytes.

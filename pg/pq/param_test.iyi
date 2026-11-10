@@ -18,7 +18,7 @@ end
 
 # Crystal's `String#to_slice`, which iyi's prelude lacks.
 def to_slice(s : String) : Bytes
-  Bytes.new(s.to_unsafe, s.bytesize, read_only: true)
+  Bytes.of(s)
 end
 
 describe "PQ::Param encoders #encode_array" do

@@ -6,6 +6,7 @@
 #
 # Every read answers `StreamError` when the bytes asked for are not there:
 # the socket failed, or the source ended first.
+@[Unsafe("the socket's reads and writes go through read and write buffers it indexes by pointer, copying frames in and out of them and reading floats by reinterpreting their bits")]
 module pg/pq/stream
 
 import std/int

@@ -5,6 +5,7 @@
 # SCRAM-SHA-256-PLUS binds the exchange to the TLS channel under it
 # (`tls-server-end-point`, RFC 5929, the binding PostgreSQL takes): a man
 # in the middle who ended TLS on both sides cannot relay it.
+@[Unsafe("the HMAC pads, PBKDF2's block number and the client proof are written a byte at a time straight into new strings' buffers")]
 module pg/pq/scram
 
 import std/int

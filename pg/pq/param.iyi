@@ -128,7 +128,7 @@ pub struct Param
   end
 
   def self.text(string : String) : Param
-    new(Bytes.new(string.to_unsafe, string.bytesize, read_only: true), string.bytesize, 0_i16, string)
+    new(Bytes.of(string), string.bytesize, 0_i16, string)
   end
 
   # The array literal of *array*: `{1,2,3}`, `{"a","b"}`, `{NULL}`.
@@ -165,9 +165,8 @@ pub struct Param
   end
 
   private def self.write_hex(io : String::Builder, bytes : Bytes) : Nil
-    digits = HEX.to_unsafe
     bytes.each do |byte|
-      io << digits[byte >> 4].unsafe_chr << digits[byte & 0x0F].unsafe_chr
+      io << HEX.byte_at(byte >> 4).unsafe_chr << HEX.byte_at(byte & 0x0F).unsafe_chr
     end
   end
 

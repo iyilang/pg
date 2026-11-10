@@ -8,7 +8,7 @@ import pg/testing/spec_helper::*
 
 def escape_literal_bytes(s : String) : String
   result = ""
-  with_connection { |conn| result = conn.escape_literal(Bytes.new(s.to_unsafe, s.bytesize, read_only: true)) }
+  with_connection { |conn| result = conn.escape_literal(Bytes.of(s)) }
   result
 end
 

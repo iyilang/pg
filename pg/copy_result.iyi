@@ -1,5 +1,6 @@
 # The data of a `COPY ... TO STDOUT`, or the sink of a `COPY ... FROM
 # STDIN`: what `PGConnection#exec_copy` answers.
+@[Unsafe("a copy is read straight into the caller's slice through its pointer, and gets_to_end writes each chunk from its buffer's pointer")]
 module pg/copy_result
 
 import std/int
