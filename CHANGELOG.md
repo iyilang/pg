@@ -1,4 +1,4 @@
-## Unreleased
+## v0.5.0
 
 Requires iyi 0.21.0 and iyi-db 0.5.0. iyi 0.21.0 refuses an operation on
 raw memory in a module that is not marked `@[Unsafe("why")]` (SPEC.md
