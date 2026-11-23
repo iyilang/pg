@@ -1,4 +1,4 @@
-## Unreleased
+## v0.6.0
 
 Requires iyi 0.22.0 and iyi-db 0.6.0. 0.22.0 writes `iyi.sum` lines as
 `h2:`, a SHA-256 that says where each file ends, which 0.21.0 does not
