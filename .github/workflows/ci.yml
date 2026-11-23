@@ -35,11 +35,19 @@ jobs:
 
       - run: iyi version
 
+      # iyi 0.22.0's `iyi test` builds several tests at once, and in a cold
+      # module cache they race fetching iyi-db (iyilang/iyi#246): fetch it
+      # first, which also checks that iyi.mod and iyi.sum are tidy.
+      - name: Fetch modules
+        run: iyi mod tidy --check
+
       # Against the server without TLS: `sslmode=prefer` is answered "no"
       # and no handshake runs inside db/db/spec's tasks, whose 256 KiB stack
       # a debug build's handshake overruns in iyi 0.18.0 (iyilang/iyi#130).
+      # One test file at a time (`-p 1`): they share the one database, and
+      # several make and drop the same tables (`person`, `contacts`).
       - name: Test
-        run: iyi test pg
+        run: iyi test -p 1 pg
 
       - name: Give the server TLS
         run: |

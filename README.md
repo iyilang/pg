@@ -433,11 +433,12 @@ mistake that postgres continues to have this as an option at all.
 ## Development
 
 ```sh
-DATABASE_URL=postgres://postgres:password@127.0.0.1/iyi_pg_test iyi test pg
+DATABASE_URL=postgres://postgres:password@127.0.0.1/iyi_pg_test iyi test -p 1 pg
 ```
 
 The tests are crystal-pg's specs, ported, beside the modules they test, and
-iyi-db's shared driver specs (`pg/driver_specs_test.iyi`). They read
+iyi-db's shared driver specs (`pg/driver_specs_test.iyi`). They share one
+database and its tables, so they run one file at a time (`-p 1`), and read
 `DATABASE_URL`, `postgres:///` by default. The replication tests that need
 `wal_level=logical` are skipped, with a note, on a server without it, and
 the md5 and cleartext authentication tests, which need matching `pg_hba.conf`

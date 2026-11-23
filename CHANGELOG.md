@@ -5,7 +5,11 @@ Requires iyi 0.22.0 and iyi-db 0.6.0. 0.22.0 writes `iyi.sum` lines as
 read, and iyi-db 0.6.0 requires 0.22.0. The driver's source is unchanged.
 
 * `iyi.sum` records iyi-db 0.6.0 in the `h2:` form.
-* CI runs on iyi 0.22.0.
+* CI runs on iyi 0.22.0, whose `iyi test` runs several test files at
+  once: the tests run one file at a time (`-p 1`), since they share one
+  database and make and drop the same tables, and the modules are fetched
+  before the tests are built
+  ([iyi#246](https://github.com/iyilang/iyi/issues/246)).
 
 ## v0.5.0
 
